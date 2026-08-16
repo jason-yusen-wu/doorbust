@@ -7,6 +7,7 @@ import (
 
 	"github.com/go-chi/chi/middleware"
 	"github.com/go-chi/chi/v5"
+	"github.com/jason-yusen-wu/doorbust/internal/products"
 )
 
 func (app *application) mount() http.Handler {
@@ -17,12 +18,14 @@ func (app *application) mount() http.Handler {
 	r.Use(middleware.RealIP)    // rate limiting, analytics & tracing
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
-
 	r.Use(middleware.Timeout(60 * time.Second))
 
+	// endpoints
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("all good"))
 	})
+	productHandler := products.NewHandler(nil)
+	r.Get("/products", productHandler.ListProducts)
 
 	return r
 }
