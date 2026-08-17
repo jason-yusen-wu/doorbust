@@ -7,6 +7,8 @@ import (
 
 	"github.com/go-chi/chi/middleware"
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5"
+	repo "github.com/jason-yusen-wu/doorbust/internal/adapters/postgresql/sqlc"
 	"github.com/jason-yusen-wu/doorbust/internal/products"
 )
 
@@ -24,7 +26,9 @@ func (app *application) mount() http.Handler {
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("all good"))
 	})
-	productHandler := products.NewHandler(nil)
+
+	productService := products.NewService(repo.New(app.db))
+	productHandler := products.NewHandler(productService)
 	r.Get("/products", productHandler.ListProducts)
 
 	return r
@@ -48,6 +52,7 @@ func (app *application) run(h http.Handler) error {
 // global struct
 type application struct {
 	config config
+	db     *pgx.Conn
 }
 
 type config struct {

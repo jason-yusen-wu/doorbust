@@ -10,4 +10,4 @@ CREATE TABLE IF NOT EXISTS products (
 
 
 -- +goose Down
-DROP TABLE IF EXISTS products
+DROP TABLE IF EXISTS products;
