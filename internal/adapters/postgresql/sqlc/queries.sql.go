@@ -7,44 +7,238 @@ package repo
 
 import (
 	"context"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const findProductByID = `-- name: FindProductByID :one
-SELECT id, name, price_in_cents, quantity, created_at FROM products WHERE id = $1
+const commitStock = `-- name: CommitStock :one
+UPDATE stock
+SET quantity = quantity - 1, num_reserved = num_reserved - 1
+WHERE product_id = $1 AND num_reserved > 0
+RETURNING id, product_id, quantity, num_reserved
 `
 
-func (q *Queries) FindProductByID(ctx context.Context, id int64) (Product, error) {
-	row := q.db.QueryRow(ctx, findProductByID, id)
-	var i Product
+// Finalizes a reservation at checkout: moves one unit out of quantity and
+// releases the matching reservation.
+func (q *Queries) CommitStock(ctx context.Context, productID int64) (Stock, error) {
+	row := q.db.QueryRow(ctx, commitStock, productID)
+	var i Stock
 	err := row.Scan(
 		&i.ID,
-		&i.Name,
-		&i.PriceInCents,
+		&i.ProductID,
 		&i.Quantity,
+		&i.NumReserved,
+	)
+	return i, err
+}
+
+const completeOrder = `-- name: CompleteOrder :one
+UPDATE orders
+SET status = 'completed'
+WHERE id = $1 AND status = 'pending'
+RETURNING id, customer_id, product_id, status, created_at
+`
+
+// Guarded by status = 'pending' so a duplicate/concurrent checkout call can
+// only ever commit stock once for a given order.
+func (q *Queries) CompleteOrder(ctx context.Context, id int64) (Order, error) {
+	row := q.db.QueryRow(ctx, completeOrder, id)
+	var i Order
+	err := row.Scan(
+		&i.ID,
+		&i.CustomerID,
+		&i.ProductID,
+		&i.Status,
 		&i.CreatedAt,
 	)
 	return i, err
 }
 
-const listProducts = `-- name: ListProducts :many
-SELECT id, name, price_in_cents, quantity, created_at FROM products
+const createOrder = `-- name: CreateOrder :one
+INSERT INTO orders (customer_id, product_id)
+VALUES ($1, $2)
+RETURNING id, customer_id, product_id, status, created_at
 `
 
-func (q *Queries) ListProducts(ctx context.Context) ([]Product, error) {
-	rows, err := q.db.Query(ctx, listProducts)
+type CreateOrderParams struct {
+	CustomerID int64 `json:"customer_id"`
+	ProductID  int64 `json:"product_id"`
+}
+
+func (q *Queries) CreateOrder(ctx context.Context, arg CreateOrderParams) (Order, error) {
+	row := q.db.QueryRow(ctx, createOrder, arg.CustomerID, arg.ProductID)
+	var i Order
+	err := row.Scan(
+		&i.ID,
+		&i.CustomerID,
+		&i.ProductID,
+		&i.Status,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const createProduct = `-- name: CreateProduct :one
+INSERT INTO products (name, price_in_cents, start_at)
+VALUES ($1, $2, $3)
+RETURNING id, name, price_in_cents, created_at, start_at
+`
+
+type CreateProductParams struct {
+	Name         string             `json:"name"`
+	PriceInCents int32              `json:"price_in_cents"`
+	StartAt      pgtype.Timestamptz `json:"start_at"`
+}
+
+func (q *Queries) CreateProduct(ctx context.Context, arg CreateProductParams) (Product, error) {
+	row := q.db.QueryRow(ctx, createProduct, arg.Name, arg.PriceInCents, arg.StartAt)
+	var i Product
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.PriceInCents,
+		&i.CreatedAt,
+		&i.StartAt,
+	)
+	return i, err
+}
+
+const createStock = `-- name: CreateStock :one
+INSERT INTO stock (product_id, quantity)
+VALUES ($1, $2)
+RETURNING id, product_id, quantity, num_reserved
+`
+
+type CreateStockParams struct {
+	ProductID int64 `json:"product_id"`
+	Quantity  int32 `json:"quantity"`
+}
+
+func (q *Queries) CreateStock(ctx context.Context, arg CreateStockParams) (Stock, error) {
+	row := q.db.QueryRow(ctx, createStock, arg.ProductID, arg.Quantity)
+	var i Stock
+	err := row.Scan(
+		&i.ID,
+		&i.ProductID,
+		&i.Quantity,
+		&i.NumReserved,
+	)
+	return i, err
+}
+
+const findOrCreateCustomer = `-- name: FindOrCreateCustomer :one
+INSERT INTO customers (email)
+VALUES ($1)
+ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
+RETURNING id, email, created_at
+`
+
+// Upsert keyed on the email unique constraint, so concurrent orders from a new
+// customer's first request can't race into duplicate customer rows.
+func (q *Queries) FindOrCreateCustomer(ctx context.Context, email string) (Customer, error) {
+	row := q.db.QueryRow(ctx, findOrCreateCustomer, email)
+	var i Customer
+	err := row.Scan(&i.ID, &i.Email, &i.CreatedAt)
+	return i, err
+}
+
+const findOrderByID = `-- name: FindOrderByID :one
+SELECT id, customer_id, product_id, status, created_at FROM orders WHERE id = $1
+`
+
+func (q *Queries) FindOrderByID(ctx context.Context, id int64) (Order, error) {
+	row := q.db.QueryRow(ctx, findOrderByID, id)
+	var i Order
+	err := row.Scan(
+		&i.ID,
+		&i.CustomerID,
+		&i.ProductID,
+		&i.Status,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const findProductByID = `-- name: FindProductByID :one
+SELECT
+    p.id, p.name, p.price_in_cents, p.created_at, p.start_at,
+    s.quantity, s.num_reserved
+FROM products p
+JOIN stock s ON s.product_id = p.id
+WHERE p.id = $1
+`
+
+type FindProductByIDRow struct {
+	ID           int64              `json:"id"`
+	Name         string             `json:"name"`
+	PriceInCents int32              `json:"price_in_cents"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	StartAt      pgtype.Timestamptz `json:"start_at"`
+	Quantity     int32              `json:"quantity"`
+	NumReserved  int32              `json:"num_reserved"`
+}
+
+func (q *Queries) FindProductByID(ctx context.Context, id int64) (FindProductByIDRow, error) {
+	row := q.db.QueryRow(ctx, findProductByID, id)
+	var i FindProductByIDRow
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.PriceInCents,
+		&i.CreatedAt,
+		&i.StartAt,
+		&i.Quantity,
+		&i.NumReserved,
+	)
+	return i, err
+}
+
+const listProducts = `-- name: ListProducts :many
+SELECT
+    p.id, p.name, p.price_in_cents, p.created_at, p.start_at,
+    s.quantity, s.num_reserved
+FROM products p
+JOIN stock s ON s.product_id = p.id
+ORDER BY (s.quantity - s.num_reserved <= 0), p.start_at ASC
+LIMIT $1 OFFSET $2
+`
+
+type ListProductsParams struct {
+	Limit  int32 `json:"limit"`
+	Offset int32 `json:"offset"`
+}
+
+type ListProductsRow struct {
+	ID           int64              `json:"id"`
+	Name         string             `json:"name"`
+	PriceInCents int32              `json:"price_in_cents"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	StartAt      pgtype.Timestamptz `json:"start_at"`
+	Quantity     int32              `json:"quantity"`
+	NumReserved  int32              `json:"num_reserved"`
+}
+
+// Sold-out products sort last; everything else sorts by start_at (already-started
+// sales first, soonest-upcoming next). Among sold-out products, the one that
+// started most recently sorts last, standing in for "most recently ended last"
+// since there's no explicit end time.
+func (q *Queries) ListProducts(ctx context.Context, arg ListProductsParams) ([]ListProductsRow, error) {
+	rows, err := q.db.Query(ctx, listProducts, arg.Limit, arg.Offset)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []Product
+	var items []ListProductsRow
 	for rows.Next() {
-		var i Product
+		var i ListProductsRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.Name,
 			&i.PriceInCents,
-			&i.Quantity,
 			&i.CreatedAt,
+			&i.StartAt,
+			&i.Quantity,
+			&i.NumReserved,
 		); err != nil {
 			return nil, err
 		}
@@ -54,4 +248,25 @@ func (q *Queries) ListProducts(ctx context.Context) ([]Product, error) {
 		return nil, err
 	}
 	return items, nil
+}
+
+const reserveStock = `-- name: ReserveStock :one
+UPDATE stock
+SET num_reserved = num_reserved + 1
+WHERE product_id = $1 AND quantity - num_reserved > 0
+RETURNING id, product_id, quantity, num_reserved
+`
+
+// Atomic check-and-increment: only succeeds while quantity - num_reserved > 0,
+// so concurrent callers can never over-reserve a product's stock.
+func (q *Queries) ReserveStock(ctx context.Context, productID int64) (Stock, error) {
+	row := q.db.QueryRow(ctx, reserveStock, productID)
+	var i Stock
+	err := row.Scan(
+		&i.ID,
+		&i.ProductID,
+		&i.Quantity,
+		&i.NumReserved,
+	)
+	return i, err
 }

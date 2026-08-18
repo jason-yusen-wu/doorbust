@@ -9,8 +9,28 @@ import (
 )
 
 type Querier interface {
-	FindProductByID(ctx context.Context, id int64) (Product, error)
-	ListProducts(ctx context.Context) ([]Product, error)
+	// Finalizes a reservation at checkout: moves one unit out of quantity and
+	// releases the matching reservation.
+	CommitStock(ctx context.Context, productID int64) (Stock, error)
+	// Guarded by status = 'pending' so a duplicate/concurrent checkout call can
+	// only ever commit stock once for a given order.
+	CompleteOrder(ctx context.Context, id int64) (Order, error)
+	CreateOrder(ctx context.Context, arg CreateOrderParams) (Order, error)
+	CreateProduct(ctx context.Context, arg CreateProductParams) (Product, error)
+	CreateStock(ctx context.Context, arg CreateStockParams) (Stock, error)
+	// Upsert keyed on the email unique constraint, so concurrent orders from a new
+	// customer's first request can't race into duplicate customer rows.
+	FindOrCreateCustomer(ctx context.Context, email string) (Customer, error)
+	FindOrderByID(ctx context.Context, id int64) (Order, error)
+	FindProductByID(ctx context.Context, id int64) (FindProductByIDRow, error)
+	// Sold-out products sort last; everything else sorts by start_at (already-started
+	// sales first, soonest-upcoming next). Among sold-out products, the one that
+	// started most recently sorts last, standing in for "most recently ended last"
+	// since there's no explicit end time.
+	ListProducts(ctx context.Context, arg ListProductsParams) ([]ListProductsRow, error)
+	// Atomic check-and-increment: only succeeds while quantity - num_reserved > 0,
+	// so concurrent callers can never over-reserve a product's stock.
+	ReserveStock(ctx context.Context, productID int64) (Stock, error)
 }
 
 var _ Querier = (*Queries)(nil)

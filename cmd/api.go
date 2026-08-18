@@ -9,6 +9,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
 	repo "github.com/jason-yusen-wu/doorbust/internal/adapters/postgresql/sqlc"
+	"github.com/jason-yusen-wu/doorbust/internal/orders"
 	"github.com/jason-yusen-wu/doorbust/internal/products"
 )
 
@@ -27,9 +28,17 @@ func (app *application) mount() http.Handler {
 		w.Write([]byte("all good"))
 	})
 
-	productService := products.NewService(repo.New(app.db))
+	productService := products.NewService(repo.New(app.db), app.db)
 	productHandler := products.NewHandler(productService)
 	r.Get("/products", productHandler.ListProducts)
+	r.Get("/products/{id}", productHandler.GetProduct)
+	r.Post("/products", productHandler.CreateProduct)
+
+	orderService := orders.NewService(repo.New(app.db), app.db)
+	orderHandler := orders.NewHandler(orderService)
+	r.Get("/orders/{id}", orderHandler.GetOrder)
+	r.Post("/orders", orderHandler.CreateOrder)
+	r.Post("/orders/{id}/checkout", orderHandler.Checkout)
 
 	return r
 }

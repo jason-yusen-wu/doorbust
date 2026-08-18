@@ -12,4 +12,5 @@ A modern, simple, and robust Go eCommerce backend with oversell-free, idempotent
 ## Quick start
 `make server`
 
-
+## System design
+[Link to whiteboard](https://www.tldraw.com/f/UTNkBEuEvJF9yf0wjVOPS?d=v0.0.1660.989.page)
