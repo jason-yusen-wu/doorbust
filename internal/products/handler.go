@@ -59,7 +59,7 @@ func (h *handler) ListProducts(w http.ResponseWriter, r *http.Request) {
 	products, err := h.service.ListProducts(r.Context(), limit, offset)
 	if err != nil {
 		log.Println(err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
 
@@ -81,7 +81,7 @@ func (h *handler) GetProduct(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		log.Println(err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
 
@@ -118,7 +118,7 @@ func (h *handler) CreateProduct(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		log.Println(err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
 

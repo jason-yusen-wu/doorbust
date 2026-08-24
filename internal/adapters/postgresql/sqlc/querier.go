@@ -21,7 +21,9 @@ type Querier interface {
 	// Upsert keyed on the email unique constraint, so concurrent orders from a new
 	// customer's first request can't race into duplicate customer rows.
 	FindOrCreateCustomer(ctx context.Context, email string) (Customer, error)
-	FindOrderByID(ctx context.Context, id int64) (Order, error)
+	// Joins the owning customer's email so callers can check ownership without a
+	// second round trip.
+	FindOrderByID(ctx context.Context, id int64) (FindOrderByIDRow, error)
 	FindProductByID(ctx context.Context, id int64) (FindProductByIDRow, error)
 	// Sold-out products sort last; everything else sorts by start_at (already-started
 	// sales first, soonest-upcoming next). Among sold-out products, the one that

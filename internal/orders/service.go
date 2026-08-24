@@ -13,12 +13,13 @@ import (
 var (
 	ErrOutOfStock      = errors.New("product is out of stock")
 	ErrOrderNotPending = errors.New("order is not pending")
+	ErrForbidden       = errors.New("caller does not own this order")
 )
 
 type Service interface {
-	GetOrder(ctx context.Context, id int64) (repo.Order, error)
+	GetOrder(ctx context.Context, id int64, callerEmail string) (repo.FindOrderByIDRow, error)
 	CreateOrder(ctx context.Context, productID int64, customerEmail string) (repo.Order, error)
-	Checkout(ctx context.Context, orderID int64) (repo.Order, error)
+	Checkout(ctx context.Context, orderID int64, callerEmail string) (repo.Order, error)
 }
 
 // implements Service interface
@@ -34,8 +35,15 @@ func NewService(repo repo.Querier, db repo.Beginner) Service {
 	}
 }
 
-func (s *svc) GetOrder(ctx context.Context, id int64) (repo.Order, error) {
-	return s.repo.FindOrderByID(ctx, id)
+func (s *svc) GetOrder(ctx context.Context, id int64, callerEmail string) (repo.FindOrderByIDRow, error) {
+	order, err := s.repo.FindOrderByID(ctx, id)
+	if err != nil {
+		return repo.FindOrderByIDRow{}, err
+	}
+	if order.CustomerEmail != callerEmail {
+		return repo.FindOrderByIDRow{}, ErrForbidden
+	}
+	return order, nil
 }
 
 // CreateOrder is the reserve half of the two-phase buy flow: it finds/creates
@@ -81,7 +89,7 @@ func (s *svc) CreateOrder(ctx context.Context, productID int64, customerEmail st
 // completed and commits its reserved stock, atomically and idempotently
 // (guarded by CompleteOrder's status = 'pending' check, so a duplicate/racing
 // call can't double-commit stock).
-func (s *svc) Checkout(ctx context.Context, orderID int64) (repo.Order, error) {
+func (s *svc) Checkout(ctx context.Context, orderID int64, callerEmail string) (repo.Order, error) {
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
 		return repo.Order{}, err
@@ -89,6 +97,16 @@ func (s *svc) Checkout(ctx context.Context, orderID int64) (repo.Order, error) {
 	defer tx.Rollback(ctx)
 
 	q := repo.New(tx)
+
+	// Ownership check runs inside the transaction, so it costs no extra
+	// round trip beyond the one the checkout already needs.
+	existing, err := q.FindOrderByID(ctx, orderID)
+	if err != nil {
+		return repo.Order{}, err
+	}
+	if existing.CustomerEmail != callerEmail {
+		return repo.Order{}, ErrForbidden
+	}
 
 	order, err := q.CompleteOrder(ctx, orderID)
 	if err != nil {

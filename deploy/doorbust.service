@@ -1,0 +1,15 @@
+[Unit]
+Description=doorbust
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+ExecStartPre=/usr/local/bin/render-doorbust-env.sh
+ExecStart=/usr/bin/docker run --rm --name doorbust --env-file /etc/doorbust.env -p 8080:8080 doorbust:latest
+ExecStop=-/usr/bin/docker stop doorbust
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

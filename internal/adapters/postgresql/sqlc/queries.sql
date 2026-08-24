@@ -54,7 +54,12 @@ ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
 RETURNING *;
 
 -- name: FindOrderByID :one
-SELECT * FROM orders WHERE id = $1;
+-- Joins the owning customer's email so callers can check ownership without a
+-- second round trip.
+SELECT o.*, c.email AS customer_email
+FROM orders o
+JOIN customers c ON c.id = o.customer_id
+WHERE o.id = $1;
 
 -- name: CreateOrder :one
 INSERT INTO orders (customer_id, product_id)

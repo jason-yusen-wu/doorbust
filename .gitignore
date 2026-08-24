@@ -1,3 +1,12 @@
 .env
-CLAUDE.md
 CONTEXT.md
+
+# terraform — state holds the generated SSH private key in plaintext, and
+# tfvars holds your IP/config, so keep both out of the repo everywhere, not
+# just under infra/.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+infra/deploy_key
+infra/deploy_key.pub

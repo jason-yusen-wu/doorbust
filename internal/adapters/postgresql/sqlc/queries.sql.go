@@ -143,18 +143,33 @@ func (q *Queries) FindOrCreateCustomer(ctx context.Context, email string) (Custo
 }
 
 const findOrderByID = `-- name: FindOrderByID :one
-SELECT id, customer_id, product_id, status, created_at FROM orders WHERE id = $1
+SELECT o.id, o.customer_id, o.product_id, o.status, o.created_at, c.email AS customer_email
+FROM orders o
+JOIN customers c ON c.id = o.customer_id
+WHERE o.id = $1
 `
 
-func (q *Queries) FindOrderByID(ctx context.Context, id int64) (Order, error) {
+type FindOrderByIDRow struct {
+	ID            int64              `json:"id"`
+	CustomerID    int64              `json:"customer_id"`
+	ProductID     int64              `json:"product_id"`
+	Status        string             `json:"status"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	CustomerEmail string             `json:"customer_email"`
+}
+
+// Joins the owning customer's email so callers can check ownership without a
+// second round trip.
+func (q *Queries) FindOrderByID(ctx context.Context, id int64) (FindOrderByIDRow, error) {
 	row := q.db.QueryRow(ctx, findOrderByID, id)
-	var i Order
+	var i FindOrderByIDRow
 	err := row.Scan(
 		&i.ID,
 		&i.CustomerID,
 		&i.ProductID,
 		&i.Status,
 		&i.CreatedAt,
+		&i.CustomerEmail,
 	)
 	return i, err
 }

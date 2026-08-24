@@ -1,8 +1,6 @@
 server:
-	docker compose up -d
-	goose up 
-	go run cmd/*.go
+	./scripts/with-env.sh goose up
+	./scripts/with-env.sh go run ./cmd
 
 clean:
-	goose down
-	docker compose down
+	./scripts/with-env.sh goose down
