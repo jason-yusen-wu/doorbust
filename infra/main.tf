@@ -145,3 +145,165 @@ resource "aws_instance" "doorbust" {
     Name = "doorbust-benchmark"
   }
 }
+
+# --- CI/CD: ECR registry + GitHub Actions OIDC deploy role ---
+#
+# GitHub Actions builds the image, pushes it here, and then drives the deploy
+# through SSM Run Command rather than SSH. That matters because the security
+# group above admits only var.allowed_cidr: a GitHub-hosted runner's IP is
+# unpredictable and would be rejected. SSM is outbound-only from the instance,
+# so nothing has to be opened for it.
+
+resource "aws_ecr_repository" "doorbust" {
+  name = "doorbust"
+
+  # Tags are git SHAs. Immutability means a deployed SHA permanently refers to
+  # exactly one image, so a rollback to an old tag can't silently get new bits.
+  image_tag_mutability = "IMMUTABLE"
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+}
+
+# Free Tier gives 500 MB of private-registry storage. The image is Alpine plus a
+# static CGO_ENABLED=0 binary (~20-30 MB) and tags share the base layer, so
+# keeping 5 lands well under the cap while still allowing a 5-deep rollback.
+resource "aws_ecr_lifecycle_policy" "doorbust" {
+  repository = aws_ecr_repository.doorbust.name
+
+  policy = jsonencode({
+    rules = [{
+      rulePriority = 1
+      description  = "Keep only the 5 most recent images"
+      selection = {
+        tagStatus   = "any"
+        countType   = "imageCountMoreThan"
+        countNumber = 5
+      }
+      action = { type = "expire" }
+    }]
+  })
+}
+
+# The instance pulls from ECR, so its role needs read access to the repo.
+# GetAuthorizationToken is account-wide by design — AWS does not scope it.
+resource "aws_iam_role_policy" "ecr_pull" {
+  name = "doorbust-ecr-pull"
+  role = aws_iam_role.instance.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = "ecr:GetAuthorizationToken"
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ecr:BatchGetImage",
+          "ecr:GetDownloadUrlForLayer",
+          "ecr:BatchCheckLayerAvailability",
+        ]
+        Resource = aws_ecr_repository.doorbust.arn
+      },
+    ]
+  })
+}
+
+# Lets the preinstalled SSM agent register the box as a managed node. Without
+# this, `aws ssm send-command` finds no target — note this is separate from the
+# ssm:GetParameter grant above, which is about reading config, not remote exec.
+resource "aws_iam_role_policy_attachment" "ssm_core" {
+  role       = aws_iam_role.instance.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+# --- GitHub OIDC: short-lived credentials instead of a stored access key ---
+
+data "tls_certificate" "github" {
+  url = "https://token.actions.githubusercontent.com"
+}
+
+resource "aws_iam_openid_connect_provider" "github" {
+  url             = "https://token.actions.githubusercontent.com"
+  client_id_list  = ["sts.amazonaws.com"]
+  thumbprint_list = [data.tls_certificate.github.certificates[0].sha1_fingerprint]
+}
+
+resource "aws_iam_role" "github_actions" {
+  name = "doorbust-github-actions"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Federated = aws_iam_openid_connect_provider.github.arn }
+      Action    = "sts:AssumeRoleWithWebIdentity"
+      Condition = {
+        StringEquals = {
+          "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
+          # Load-bearing: without a sub condition, ANY repo on GitHub could
+          # assume this role. Pinning to refs/heads/main also means a pull
+          # request — including one from a fork — cannot deploy.
+          "token.actions.githubusercontent.com:sub" = "repo:${var.github_repo}:ref:refs/heads/main"
+        }
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "github_actions" {
+  name = "doorbust-github-actions"
+  role = aws_iam_role.github_actions.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = "ecr:GetAuthorizationToken"
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ecr:BatchCheckLayerAvailability",
+          "ecr:InitiateLayerUpload",
+          "ecr:UploadLayerPart",
+          "ecr:CompleteLayerUpload",
+          "ecr:PutImage",
+          "ecr:BatchGetImage",
+          "ecr:GetDownloadUrlForLayer",
+        ]
+        Resource = aws_ecr_repository.doorbust.arn
+      },
+      {
+        # Describe* calls don't support resource-level permissions. The workflow
+        # uses this to find the instance by tag, since Terraform state is local
+        # and `terraform output` isn't available to a runner.
+        Effect   = "Allow"
+        Action   = "ec2:DescribeInstances"
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = "ssm:SendCommand"
+        Resource = [
+          aws_instance.doorbust.arn,
+          "arn:aws:ssm:${var.region}::document/AWS-RunShellScript",
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ssm:GetCommandInvocation",
+          "ssm:ListCommandInvocations",
+        ]
+        Resource = "*"
+      },
+    ]
+  })
+}
