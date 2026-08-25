@@ -15,9 +15,19 @@ concurrency:
   # would leave the box half-updated. Pushes to main queue up instead.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# Both tools are installed from their upstream prebuilt binaries rather than
+# `go install`, which compiles them from source on every run (sqlc especially —
+# it vendors a full PostgreSQL parser and a WASM runtime). Their dependencies
+# are not in this repo's go.sum, so setup-go's cache does not help them.
+#
+# `go install` verifies modules against GOSUMDB; a release download has no such
+# check, so the SHA-256s below are mandatory, not decorative. To bump a version,
+# change the pair here and nowhere else.
 env:
   SQLC_VERSION: v1.31.1   # must match the version that generated the committed code
+  SQLC_SHA256: 497ae4fcdfa64c5b0c311ffe4c2bd991e43991e82e5367792ed78bc2dca27354
   GOOSE_VERSION: v3.27.3
+  GOOSE_SHA256: ca18112e2438b3ad608af9a5938beafd01fa36a4a19a3edbe4f29226ca5c8533
 
 jobs:
   build:
@@ -37,12 +47,21 @@ jobs:
       - name: go build
         run: go build ./...
 
+      # The release asset drops the leading `v` that SQLC_VERSION carries.
+      - name: Install sqlc
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fsSL -o "$RUNNER_TEMP/sqlc.tar.gz" \
+            "https://github.com/sqlc-dev/sqlc/releases/download/${SQLC_VERSION}/sqlc_${SQLC_VERSION#v}_linux_amd64.tar.gz"
+          echo "${SQLC_SHA256}  $RUNNER_TEMP/sqlc.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/sqlc.tar.gz" -C "$RUNNER_TEMP/bin" sqlc
+          chmod +x "$RUNNER_TEMP/bin/sqlc"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
       # queries.sql.go and friends are committed, so they can drift from
       # queries.sql / the migrations. `sqlc diff` fails if regeneration is due.
       - name: sqlc up to date
-        run: |
-          go install github.com/sqlc-dev/sqlc/cmd/sqlc@${SQLC_VERSION}
-          sqlc diff
+        run: sqlc diff
 
   test:
     name: test
@@ -61,9 +80,9 @@ jobs:
         ports: ['5432:5432']
         options: >-
           --health-cmd pg_isready
-          --health-interval 5s
+          --health-interval 2s
           --health-timeout 5s
-          --health-retries 10
+          --health-retries 15
 
     env:
       # Set directly rather than through scripts/with-env.sh, which requires a
@@ -81,10 +100,17 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Migrate test database
+      - name: Install goose
         run: |
-          go install github.com/pressly/goose/v3/cmd/goose@${GOOSE_VERSION}
-          "$(go env GOPATH)/bin/goose" up
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fsSL -o "$RUNNER_TEMP/bin/goose" \
+            "https://github.com/pressly/goose/releases/download/${GOOSE_VERSION}/goose_linux_x86_64"
+          echo "${GOOSE_SHA256}  $RUNNER_TEMP/bin/goose" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/bin/goose"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Migrate test database
+        run: goose up
 
       # -race matters here: the whole point of the suite is concurrent access.
       - name: go test
@@ -112,13 +138,18 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Needed for the goose install below: setup-go puts $(go env GOPATH)/bin
-      # on PATH. Without it `go install` silently succeeds and the binary is
-      # then unreachable. Also pins the same Go version the other jobs use.
-      - uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-          cache: true
+      # Deliberately before the credentials step: no reason to be fetching a
+      # remote binary while this job is holding AWS credentials. This job needs
+      # no Go toolchain at all — the Dockerfile compiles the app inside the
+      # image — so there is no actions/setup-go here.
+      - name: Install goose
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fsSL -o "$RUNNER_TEMP/bin/goose" \
+            "https://github.com/pressly/goose/releases/download/${GOOSE_VERSION}/goose_linux_x86_64"
+          echo "${GOOSE_SHA256}  $RUNNER_TEMP/bin/goose" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/bin/goose"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
 
       - name: Assume AWS deploy role
         uses: aws-actions/configure-aws-credentials@v6
@@ -149,9 +180,7 @@ jobs:
           GOOSE_DRIVER: postgres
           GOOSE_DBSTRING: ${{ secrets.NEON_DSN }}
           GOOSE_MIGRATION_DIR: ./internal/adapters/postgresql/migrations
-        run: |
-          go install github.com/pressly/goose/v3/cmd/goose@${GOOSE_VERSION}
-          goose up
+        run: goose up
 
       # Terraform state is local and gitignored, so `terraform output` is not
       # available here. Find the box by its tag instead.
