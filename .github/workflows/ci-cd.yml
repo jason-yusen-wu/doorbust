@@ -24,9 +24,9 @@ jobs:
     name: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod   # tracks the `go 1.26.5` directive
           cache: true               # module + build cache, keyed off go.sum
@@ -74,9 +74,9 @@ jobs:
       TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/doorbust_test?sslmode=disable
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
@@ -110,18 +110,18 @@ jobs:
       IMAGE: ${{ vars.ECR_REPOSITORY_URL }}:${{ github.sha }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Needed for the goose install below: setup-go puts $(go env GOPATH)/bin
       # on PATH. Without it `go install` silently succeeds and the binary is
       # then unreachable. Also pins the same Go version the other jobs use.
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
 
       - name: Assume AWS deploy role
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
@@ -129,12 +129,12 @@ jobs:
       - name: Log in to ECR
         uses: aws-actions/amazon-ecr-login@v2
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       # No --platform/QEMU needed: ubuntu-latest is x86_64, matching the
       # AL2023 AMI. (An arm64 image would exec format error on the instance.)
       - name: Build and push image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: true
