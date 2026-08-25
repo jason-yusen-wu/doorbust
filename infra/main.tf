@@ -246,9 +246,11 @@ resource "aws_iam_role" "github_actions" {
         StringEquals = {
           "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
           # Load-bearing: without a sub condition, ANY repo on GitHub could
-          # assume this role. Pinning to refs/heads/main also means a pull
-          # request — including one from a fork — cannot deploy.
-          "token.actions.githubusercontent.com:sub" = "repo:${var.github_repo}:ref:refs/heads/main"
+          # assume this role. This pins to the `production` environment, and
+          # that environment's deployment branch policy allows only `main` —
+          # so a pull request cannot obtain a token with this subject at all.
+          # See var.github_oidc_subject for the claim format's two gotchas.
+          "token.actions.githubusercontent.com:sub" = var.github_oidc_subject
         }
       }
     }]

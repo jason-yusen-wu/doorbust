@@ -25,8 +25,29 @@ variable "cognito_client_id" {
   type        = string
 }
 
-variable "github_repo" {
-  description = "GitHub repo allowed to assume the CI deploy role, as \"owner/name\". Used only in the OIDC trust policy's sub condition — this is what stops any other repo on GitHub from assuming the role."
+variable "github_oidc_subject" {
+  description = <<-EOT
+    Exact `sub` claim on the OIDC token GitHub Actions presents. This is what
+    stops any other repo on GitHub from assuming the deploy role, so it must
+    match byte-for-byte. Two things shape it, and both are easy to get wrong:
+
+      * A job that references an `environment:` gets `:environment:<name>`,
+        NOT `:ref:refs/heads/<branch>`. The environment form takes precedence.
+      * Repos created after 2026-07-15 use immutable subject claims, which
+        embed numeric owner and repo IDs: `owner@<owner-id>/repo@<repo-id>`.
+        These survive renames, which is why they are preferred.
+
+    Do not hand-assemble this. Read the real value from a failed (or
+    successful) assume-role call:
+
+      aws cloudtrail lookup-events --region us-east-2 \
+        --lookup-attributes AttributeKey=EventName,AttributeValue=AssumeRoleWithWebIdentity \
+        --max-results 1 --query 'Events[0].CloudTrailEvent' --output text \
+        | jq -r .userIdentity.userName
+
+    Never widen this to a StringLike wildcard on the owner segment —
+    `repo:jason-yusen-wu*/...` would also match `jason-yusen-wu-evil`.
+  EOT
   type        = string
-  default     = "jason-yusen-wu/doorbust"
+  default     = "repo:jason-yusen-wu@286712433/doorbust@1336413790:environment:production"
 }

@@ -84,7 +84,7 @@ jobs:
       - name: Migrate test database
         run: |
           go install github.com/pressly/goose/v3/cmd/goose@${GOOSE_VERSION}
-          goose up
+          "$(go env GOPATH)/bin/goose" up
 
       # -race matters here: the whole point of the suite is concurrent access.
       - name: go test
@@ -111,6 +111,14 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      # Needed for the goose install below: setup-go puts $(go env GOPATH)/bin
+      # on PATH. Without it `go install` silently succeeds and the binary is
+      # then unreachable. Also pins the same Go version the other jobs use.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
 
       - name: Assume AWS deploy role
         uses: aws-actions/configure-aws-credentials@v4
