@@ -24,3 +24,9 @@ variable "cognito_client_id" {
   description = "Cognito app client ID — not secret, stored as a plain SSM String param."
   type        = string
 }
+
+variable "github_repo" {
+  description = "GitHub repo allowed to assume the CI deploy role, as \"owner/name\". Used only in the OIDC trust policy's sub condition — this is what stops any other repo on GitHub from assuming the role."
+  type        = string
+  default     = "jason-yusen-wu/doorbust"
+}

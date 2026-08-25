@@ -1,0 +1,232 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege by default. The deploy job widens this for itself.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  # Superseded PR runs are worth cancelling; an in-flight deploy is not — it
+  # would leave the box half-updated. Pushes to main queue up instead.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  SQLC_VERSION: v1.31.1   # must match the version that generated the committed code
+  GOOSE_VERSION: v3.27.3
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod   # tracks the `go 1.26.5` directive
+          cache: true               # module + build cache, keyed off go.sum
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      # queries.sql.go and friends are committed, so they can drift from
+      # queries.sql / the migrations. `sqlc diff` fails if regeneration is due.
+      - name: sqlc up to date
+        run: |
+          go install github.com/sqlc-dev/sqlc/cmd/sqlc@${SQLC_VERSION}
+          sqlc diff
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+
+    # A throwaway Postgres beside the job. The oversell guarantee lives in SQL
+    # (ReserveStock's `quantity - num_reserved > 0`, CompleteOrder's
+    # `status = 'pending'`), so a mocked repo.Querier cannot exercise it — the
+    # concurrency test needs real row locking.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: doorbust_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Set directly rather than through scripts/with-env.sh, which requires a
+      # .env file that does not exist on a runner.
+      GOOSE_DRIVER: postgres
+      GOOSE_DBSTRING: postgres://postgres:postgres@localhost:5432/doorbust_test?sslmode=disable
+      GOOSE_MIGRATION_DIR: ./internal/adapters/postgresql/migrations
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/doorbust_test?sslmode=disable
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Migrate test database
+        run: |
+          go install github.com/pressly/goose/v3/cmd/goose@${GOOSE_VERSION}
+          goose up
+
+      # -race matters here: the whole point of the suite is concurrent access.
+      - name: go test
+        run: go test -race ./...
+
+  deploy:
+    name: deploy
+    needs: [build, test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    # Gates access to the NEON_DSN secret. The environment's deployment branch
+    # policy allows only `main`, so a pull_request run — which CAN see plain
+    # repository secrets — is refused before the job starts and never receives
+    # the DSN. The `if:` above is convenience; this is the enforcement.
+    environment: production
+
+    permissions:
+      contents: read
+      id-token: write   # lets the job request the OIDC token AWS trades for creds
+
+    env:
+      IMAGE: ${{ vars.ECR_REPOSITORY_URL }}:${{ github.sha }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assume AWS deploy role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Log in to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      # No --platform/QEMU needed: ubuntu-latest is x86_64, matching the
+      # AL2023 AMI. (An arm64 image would exec format error on the instance.)
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Runs before the restart, so for a few seconds the old binary sees the
+      # new schema. Keep migrations backward-compatible (expand-then-contract).
+      - name: Migrate Neon
+        env:
+          GOOSE_DRIVER: postgres
+          GOOSE_DBSTRING: ${{ secrets.NEON_DSN }}
+          GOOSE_MIGRATION_DIR: ./internal/adapters/postgresql/migrations
+        run: |
+          go install github.com/pressly/goose/v3/cmd/goose@${GOOSE_VERSION}
+          goose up
+
+      # Terraform state is local and gitignored, so `terraform output` is not
+      # available here. Find the box by its tag instead.
+      - name: Find the instance
+        id: instance
+        run: |
+          id="$(aws ec2 describe-instances \
+            --filters 'Name=tag:Name,Values=doorbust-benchmark' \
+                      'Name=instance-state-name,Values=running' \
+            --query 'Reservations[0].Instances[0].InstanceId' \
+            --output text)"
+          if [ -z "$id" ] || [ "$id" = "None" ]; then
+            echo "::error::No running instance tagged doorbust-benchmark found."
+            exit 1
+          fi
+          echo "Found $id"
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy via SSM
+        id: send
+        run: |
+          set -euo pipefail
+          cat > /tmp/remote-deploy.sh <<EOF
+          set -euo pipefail
+          IMAGE="${IMAGE}"
+          REGISTRY="\${IMAGE%%/*}"
+
+          aws ecr get-login-password --region "${{ vars.AWS_REGION }}" \
+            | docker login --username AWS --password-stdin "\$REGISTRY"
+
+          docker pull "\$IMAGE"
+          # doorbust.service runs the fixed local tag doorbust:latest, and that
+          # unit file is inlined into user_data — editing it would force an
+          # instance replacement. Retagging keeps the unit untouched.
+          docker tag "\$IMAGE" doorbust:latest
+          systemctl restart doorbust
+
+          for i in \$(seq 1 15); do
+            if curl -fsS localhost:8080/health; then
+              echo "; health OK after \$i attempt(s)"
+              break
+            fi
+            if [ "\$i" = 15 ]; then
+              echo "health check never passed"
+              journalctl -u doorbust -n 50 --no-pager
+              exit 1
+            fi
+            sleep 2
+          done
+
+          docker image prune -af --filter "until=24h"
+          EOF
+
+          cid="$(aws ssm send-command \
+            --instance-ids '${{ steps.instance.outputs.id }}' \
+            --document-name AWS-RunShellScript \
+            --comment "deploy ${GITHUB_SHA:0:7}" \
+            --parameters "$(jq -n --rawfile s /tmp/remote-deploy.sh '{commands: [$s]}')" \
+            --query Command.CommandId --output text)"
+          echo "Command $cid dispatched"
+          echo "id=$cid" >> "$GITHUB_OUTPUT"
+
+      # send-command returns as soon as the command is QUEUED. Without this the
+      # job would go green on a deploy that crashed on the box.
+      - name: Wait for the deploy to finish
+        run: |
+          set -euo pipefail
+          cid='${{ steps.send.outputs.id }}'
+          iid='${{ steps.instance.outputs.id }}'
+          for _ in $(seq 1 60); do
+            status="$(aws ssm get-command-invocation \
+              --command-id "$cid" --instance-id "$iid" \
+              --query Status --output text 2>/dev/null || echo Pending)"
+            case "$status" in
+              Pending|InProgress|Delayed) sleep 5 ;;
+              *) break ;;
+            esac
+          done
+
+          aws ssm get-command-invocation --command-id "$cid" --instance-id "$iid" \
+            --query 'StandardOutputContent' --output text
+          aws ssm get-command-invocation --command-id "$cid" --instance-id "$iid" \
+            --query 'StandardErrorContent' --output text >&2
+
+          echo "Final status: $status"
+          [ "$status" = "Success" ]
