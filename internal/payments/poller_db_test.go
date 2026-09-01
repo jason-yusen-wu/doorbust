@@ -100,6 +100,10 @@ func TestPollerReportsLastSuccess(t *testing.T) {
 	if poller.Interval() != 5*time.Millisecond {
 		t.Errorf("Interval = %v, want 5ms", poller.Interval())
 	}
+	// Readiness needs this to tell "not polled yet" from "never managed to".
+	if poller.StartedAt().IsZero() {
+		t.Error("StartedAt is zero; readiness could not judge a poller that never succeeds")
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

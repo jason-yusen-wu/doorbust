@@ -120,9 +120,12 @@ jobs:
       # -shuffle=on catches order dependence, which per-test database isolation
       # is what makes survivable. -coverpkg=./... is required or the HTTP tests
       # in cmd credit none of their coverage to the packages they exercise.
+      # -count=1 defeats the test cache, which `setup-go` restores between
+      # runs: without it a green result can come from a previous commit's
+      # cached run rather than this one's code.
       - name: go test
         run: |
-          go test -race -shuffle=on -timeout=10m \
+          go test -race -shuffle=on -count=1 -timeout=10m \
             -coverpkg=./... -coverprofile=coverage.out ./...
 
       # Per-package floors rather than one repo-wide number: a global figure is

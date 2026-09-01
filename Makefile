@@ -47,7 +47,9 @@ test-all:
 # Coverage with the per-package floors enforced. -coverpkg=./... is required
 # or the HTTP tests in cmd would credit none of their coverage to the packages
 # they actually exercise.
+# -count=1 defeats the test cache. A gate that can report a cached result is
+# not a gate: an unrelated change would leave it green against stale coverage.
 cover:
-	TEST_DATABASE_URL="$(TEST_DATABASE_URL)" go test -race -timeout=5m \
+	TEST_DATABASE_URL="$(TEST_DATABASE_URL)" go test -race -count=1 -timeout=5m \
 		-coverpkg=./... -coverprofile=coverage.out ./...
 	@./scripts/check-coverage.sh coverage.out
