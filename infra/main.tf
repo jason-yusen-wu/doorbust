@@ -126,6 +126,32 @@ resource "aws_ssm_parameter" "cognito_client_id" {
   value = var.cognito_client_id
 }
 
+resource "aws_ssm_parameter" "cognito_vendor_group" {
+  name  = "/doorbust/COGNITO_VENDOR_GROUP"
+  type  = "String"
+  value = var.vendor_group_name
+}
+
+# --- Authorization ---
+# The user pool is created out-of-band, but the group that gates POST /products
+# is managed here so the app's authorization model is not purely tribal
+# knowledge sitting in someone's console history.
+#
+# Creating the group grants nothing on its own — membership is per-user:
+#
+#   aws cognito-idp admin-add-user-to-group \
+#     --user-pool-id ${var.cognito_user_pool_id} \
+#     --username <user> --group-name ${var.vendor_group_name}
+#
+# Membership rides in the ID token, so it takes effect on the next token
+# Cognito issues. An already signed-in session keeps its old claims until it
+# refreshes.
+resource "aws_cognito_user_group" "vendors" {
+  name         = var.vendor_group_name
+  user_pool_id = var.cognito_user_pool_id
+  description  = "May create products via POST /products"
+}
+
 # --- The instance itself ---
 
 resource "aws_instance" "doorbust" {
@@ -143,6 +169,25 @@ resource "aws_instance" "doorbust" {
 
   tags = {
     Name = "doorbust-benchmark"
+  }
+
+  lifecycle {
+    # data.aws_ami.al2023 uses most_recent = true, so its id changes every
+    # time Amazon publishes a new AL2023 image — which forced this instance to
+    # be replaced on any apply that happened to follow one. That is a trap:
+    # applying an unrelated change (adding an SSM param, say) would terminate
+    # the box, and the replacement comes up with no container image loaded, so
+    # the app stays down until a deploy re-pushes it. The public IP changes
+    # too, since there is no Elastic IP.
+    #
+    # most_recent is still right for choosing the image when the instance is
+    # first created; it is only the recycling of a running box that is
+    # unwanted. Ignoring the attribute keeps both.
+    #
+    # To deliberately move to a newer AMI, replace the instance explicitly:
+    #   terraform apply -replace=aws_instance.doorbust
+    # and remember it needs a redeploy afterwards to reload the image.
+    ignore_changes = [ami]
   }
 }
 

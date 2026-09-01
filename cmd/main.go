@@ -15,7 +15,8 @@ func main() {
 	// create Top-level Context
 	ctx := context.Background()
 	cfg := config{
-		addr: ":8080",
+		addr:            ":8080",
+		shutdownTimeout: env.GetDuration("SHUTDOWN_TIMEOUT", 15*time.Second),
 		db: postgresql.Config{
 			DSN:             env.MustGetString("GOOSE_DBSTRING"),
 			MaxConns:        int32(env.GetInt("DB_MAX_CONNS", 25)),
@@ -27,6 +28,35 @@ func main() {
 		cognito: cognitoConfig{
 			issuerURL: env.MustGetString("COGNITO_ISSUER_URL"),
 			clientID:  env.MustGetString("COGNITO_CLIENT_ID"),
+			// Has a safe default because the failure mode is safe: if this
+			// does not match a real Cognito group, nobody is a vendor and
+			// POST /products is closed to everyone.
+			vendorGroup: env.GetString("COGNITO_VENDOR_GROUP", "vendors"),
+		},
+		stripe: stripeConfig{
+			// Required, like the DSN: a missing key would otherwise surface
+			// as every checkout failing at runtime instead of at boot.
+			secretKey:     env.MustGetString("STRIPE_SECRET_KEY"),
+			webhookSecret: env.MustGetString("STRIPE_WEBHOOK_SECRET"),
+			currency:      env.GetString("STRIPE_CURRENCY", "usd"),
+		},
+		orders: ordersConfig{
+			reservationTTL: env.GetDuration("RESERVATION_TTL", 15*time.Minute),
+			sweepInterval:  env.GetDuration("RESERVATION_SWEEP_INTERVAL", time.Minute),
+			sweepBatchSize: int32(env.GetInt("RESERVATION_SWEEP_BATCH", 100)),
+		},
+		payments: paymentsConfig{
+			pollInterval: env.GetDuration("STRIPE_POLL_INTERVAL", 5*time.Second),
+			maxAttempts:  int32(env.GetInt("STRIPE_MAX_ATTEMPTS", 5)),
+
+			// Set STRIPE_EVENT_POLL_INTERVAL=0 to disable pulling and rely on
+			// the webhook endpoint instead (what `stripe listen` does).
+			eventPollInterval: env.GetDuration("STRIPE_EVENT_POLL_INTERVAL", 10*time.Second),
+			// Generous on purpose: the cost of re-scanning is zero (the
+			// insert dedups on Stripe's event id) and the cost of a window
+			// that is too small is a permanently skipped event.
+			eventPollOverlap:     env.GetDuration("STRIPE_EVENT_POLL_OVERLAP", 2*time.Minute),
+			eventInitialLookback: env.GetDuration("STRIPE_EVENT_INITIAL_LOOKBACK", time.Hour),
 		},
 	}
 

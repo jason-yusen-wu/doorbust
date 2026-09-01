@@ -25,6 +25,33 @@ variable "cognito_client_id" {
   type        = string
 }
 
+variable "cognito_user_pool_id" {
+  description = <<-EOT
+    Cognito user pool ID (e.g. "us-east-2_xxxxxxxxx"). It is the last path
+    segment of cognito_issuer_url, but is declared separately rather than
+    parsed out of that URL in HCL — a string-splitting expression here would
+    be a silent source of breakage if the URL format ever changed.
+
+    Terraform does not manage the user pool itself (it predates this config
+    and is created out-of-band); this is only used to attach the vendors
+    group to it.
+  EOT
+  type        = string
+}
+
+variable "vendor_group_name" {
+  description = <<-EOT
+    Cognito group whose members may create products (POST /products). Must
+    match the app's COGNITO_VENDOR_GROUP env var, which defaults to "vendors".
+
+    The failure mode is safe in one direction only: if this group does not
+    exist, nobody is a vendor and POST /products is closed to everyone. There
+    is no configuration that accidentally opens it.
+  EOT
+  type        = string
+  default     = "vendors"
+}
+
 variable "github_oidc_subject" {
   description = <<-EOT
     Exact `sub` claim on the OIDC token GitHub Actions presents. This is what

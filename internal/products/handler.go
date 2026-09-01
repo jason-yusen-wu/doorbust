@@ -1,7 +1,6 @@
 package products
 
 import (
-	stdjson "encoding/json"
 	"errors"
 	"log"
 	"net/http"
@@ -31,13 +30,41 @@ func NewHandler(service Service) *handler {
 	}
 }
 
+// productResponse is the wire shape of a product. The generated repo rows
+// can't carry a computed field, so the handler layer owns the mapping and
+// adds Available — otherwise every client has to re-derive stock math, and
+// they'd all have to agree on it.
+type productResponse struct {
+	ID           int64              `json:"id"`
+	Name         string             `json:"name"`
+	PriceInCents int32              `json:"price_in_cents"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	StartAt      pgtype.Timestamptz `json:"start_at"`
+	Quantity     int32              `json:"quantity"`
+	NumReserved  int32              `json:"num_reserved"`
+	Available    int32              `json:"available"`
+}
+
+func newProductResponse(id int64, name string, priceInCents int32, createdAt, startAt pgtype.Timestamptz, quantity, numReserved int32) productResponse {
+	return productResponse{
+		ID:           id,
+		Name:         name,
+		PriceInCents: priceInCents,
+		CreatedAt:    createdAt,
+		StartAt:      startAt,
+		Quantity:     quantity,
+		NumReserved:  numReserved,
+		Available:    quantity - numReserved,
+	}
+}
+
 // handler to list current and upcoming sales, paginated via ?limit=&offset=
 func (h *handler) ListProducts(w http.ResponseWriter, r *http.Request) {
 	limit := int32(defaultListLimit)
 	if v := r.URL.Query().Get("limit"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n <= 0 {
-			http.Error(w, "invalid limit", http.StatusBadRequest)
+			json.WriteError(w, http.StatusBadRequest, json.CodeInvalidRequest, "invalid limit")
 			return
 		}
 		limit = int32(n)
@@ -50,42 +77,49 @@ func (h *handler) ListProducts(w http.ResponseWriter, r *http.Request) {
 	if v := r.URL.Query().Get("offset"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 0 {
-			http.Error(w, "invalid offset", http.StatusBadRequest)
+			json.WriteError(w, http.StatusBadRequest, json.CodeInvalidRequest, "invalid offset")
 			return
 		}
 		offset = int32(n)
 	}
 
-	products, err := h.service.ListProducts(r.Context(), limit, offset)
+	rows, err := h.service.ListProducts(r.Context(), limit, offset)
 	if err != nil {
 		log.Println(err)
-		http.Error(w, "internal server error", http.StatusInternalServerError)
+		json.WriteInternalError(w)
 		return
 	}
 
-	json.Write(w, http.StatusOK, products)
+	// Always emit [] rather than null on an empty page — a client iterating
+	// the result shouldn't have to special-case it.
+	out := make([]productResponse, 0, len(rows))
+	for _, p := range rows {
+		out = append(out, newProductResponse(p.ID, p.Name, p.PriceInCents, p.CreatedAt, p.StartAt, p.Quantity, p.NumReserved))
+	}
+
+	json.Write(w, http.StatusOK, out)
 }
 
 // handler to get a single product's details
 func (h *handler) GetProduct(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
 	if err != nil {
-		http.Error(w, "invalid product id", http.StatusBadRequest)
+		json.WriteError(w, http.StatusBadRequest, json.CodeInvalidRequest, "invalid product id")
 		return
 	}
 
-	product, err := h.service.GetProduct(r.Context(), id)
+	p, err := h.service.GetProduct(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			http.Error(w, "product not found", http.StatusNotFound)
+			json.WriteError(w, http.StatusNotFound, json.CodeNotFound, "product not found")
 			return
 		}
 		log.Println(err)
-		http.Error(w, "internal server error", http.StatusInternalServerError)
+		json.WriteInternalError(w)
 		return
 	}
 
-	json.Write(w, http.StatusOK, product)
+	json.Write(w, http.StatusOK, newProductResponse(p.ID, p.Name, p.PriceInCents, p.CreatedAt, p.StartAt, p.Quantity, p.NumReserved))
 }
 
 type createProductRequest struct {
@@ -98,19 +132,19 @@ type createProductRequest struct {
 // handler for vendors to add a sale event to the storefront
 func (h *handler) CreateProduct(w http.ResponseWriter, r *http.Request) {
 	var req createProductRequest
-	if err := stdjson.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+	if err := json.Decode(r, &req); err != nil {
+		json.WriteError(w, http.StatusBadRequest, json.CodeInvalidRequest, "invalid request body")
 		return
 	}
 	if req.Name == "" || req.PriceInCents < 0 || req.Quantity < 0 {
-		http.Error(w, "name, non-negative price_in_cents and quantity are required", http.StatusBadRequest)
+		json.WriteError(w, http.StatusBadRequest, json.CodeInvalidRequest, "name, non-negative price_in_cents and quantity are required")
 		return
 	}
 	if req.StartAt.IsZero() {
 		req.StartAt = time.Now()
 	}
 
-	product, err := h.service.CreateProduct(r.Context(), CreateProductParams{
+	p, err := h.service.CreateProduct(r.Context(), CreateProductParams{
 		Name:         req.Name,
 		PriceInCents: req.PriceInCents,
 		StartAt:      pgtype.Timestamptz{Time: req.StartAt, Valid: true},
@@ -118,9 +152,9 @@ func (h *handler) CreateProduct(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		log.Println(err)
-		http.Error(w, "internal server error", http.StatusInternalServerError)
+		json.WriteInternalError(w)
 		return
 	}
 
-	json.Write(w, http.StatusCreated, product)
+	json.Write(w, http.StatusCreated, newProductResponse(p.ID, p.Name, p.PriceInCents, p.CreatedAt, p.StartAt, p.Quantity, p.NumReserved))
 }
