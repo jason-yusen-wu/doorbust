@@ -23,6 +23,7 @@ internal/auth:90
 internal/json:90
 internal/products:80
 internal/customers:80
+internal/web:85
 "
 
 module="$(go list -m)"

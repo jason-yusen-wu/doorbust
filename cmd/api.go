@@ -12,6 +12,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/cors"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jason-yusen-wu/doorbust/internal/adapters/postgresql"
 	repo "github.com/jason-yusen-wu/doorbust/internal/adapters/postgresql/sqlc"
@@ -20,6 +21,7 @@ import (
 	"github.com/jason-yusen-wu/doorbust/internal/orders"
 	"github.com/jason-yusen-wu/doorbust/internal/payments"
 	"github.com/jason-yusen-wu/doorbust/internal/products"
+	"github.com/jason-yusen-wu/doorbust/internal/web"
 	"github.com/stripe/stripe-go/v83"
 	"golang.org/x/sync/errgroup"
 )
@@ -33,6 +35,26 @@ func (app *application) mount() http.Handler {
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(60 * time.Second))
+
+	// Cross-origin access is off unless an origin is named, which in practice
+	// means it is off in production: the frontend is served from this same
+	// process, so the browser never makes a cross-origin request. It exists for
+	// `npm run dev`, where Vite serves the app from :5173 and every call to
+	// :8080 is cross-origin.
+	//
+	// Closed by default on purpose, the same way COGNITO_VENDOR_GROUP fails
+	// closed: a misconfiguration should deny access, never widen it.
+	if len(app.config.corsAllowedOrigins) > 0 {
+		r.Use(cors.Handler(cors.Options{
+			AllowedOrigins: app.config.corsAllowedOrigins,
+			AllowedMethods: []string{http.MethodGet, http.MethodPost, http.MethodDelete, http.MethodOptions},
+			AllowedHeaders: []string{"Authorization", "Content-Type"},
+			// We authenticate with a bearer token, not a cookie. Allowing
+			// credentials would also forbid a wildcard origin, and buys nothing.
+			AllowCredentials: false,
+			MaxAge:           300,
+		}))
+	}
 
 	queries := repo.New(app.db)
 
@@ -135,6 +157,11 @@ func (app *application) mount() http.Handler {
 	// after the poller exists so it can report on it.
 	r.Get("/health/ready", app.readyHandler(poller))
 
+	// The storefront, last: chi matches specific patterns before "/*", so every
+	// route above still wins. Registered as GET only, so a POST to an unknown
+	// path is still a 405 rather than a page.
+	r.Get("/*", web.Handler(app.config.webDistDir).ServeHTTP)
+
 	return r
 }
 
@@ -228,6 +255,13 @@ type config struct {
 	stripe          stripeConfig
 	orders          ordersConfig
 	payments        paymentsConfig
+
+	// corsAllowedOrigins is empty in production, where the frontend is served
+	// from this process and nothing is cross-origin. Empty disables CORS.
+	corsAllowedOrigins []string
+	// webDistDir holds the built frontend. Missing is fine — the API serves
+	// without it.
+	webDistDir string
 }
 
 type cognitoConfig struct {

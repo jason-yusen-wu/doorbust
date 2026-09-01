@@ -63,6 +63,41 @@ jobs:
       - name: sqlc up to date
         run: sqlc diff
 
+  # The storefront. Runs beside build/test rather than inside them: it shares
+  # no toolchain with the Go jobs, and keeping it separate means a frontend
+  # failure is legible as one at a glance.
+  web:
+    name: web
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22          # matches the Dockerfile's node:22-alpine
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # ci, not install: it installs exactly the lockfile and fails if
+      # package.json has drifted from it, which is the frontend's equivalent of
+      # the `sqlc diff` drift check in the build job.
+      - run: npm ci
+
+      - run: npm run lint
+
+      - run: npm run typecheck
+
+      - run: npx vitest run
+
+      # Building here is what makes this job meaningful for the deploy: the
+      # image build compiles the same bundle, so a type error or a broken
+      # import fails the PR rather than the deploy.
+      - run: npx vite build
+
   test:
     name: test
     runs-on: ubuntu-latest
@@ -146,7 +181,7 @@ jobs:
 
   deploy:
     name: deploy
-    needs: [build, test]
+    needs: [build, test, web]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
 
@@ -192,6 +227,15 @@ jobs:
 
       # No --platform/QEMU needed: ubuntu-latest is x86_64, matching the
       # AL2023 AMI. (An arm64 image would exec format error on the instance.)
+      # The image carries the storefront as well as the API, so the frontend's
+      # build-time configuration is passed in here. These are repository
+      # VARIABLES, not secrets, and deliberately so: build args land in
+      # `docker history`, and every value below is one the browser holds anyway
+      # (a Cognito domain, a public app client id, a Stripe publishable key).
+      # Never add STRIPE_SECRET_KEY or the DSN to this list — they stay in SSM.
+      #
+      # VITE_API_BASE_URL is empty: the Go binary serves the bundle, so the API
+      # is same-origin and every request is a relative path.
       - name: Build and push image
         uses: docker/build-push-action@v7
         with:
@@ -200,6 +244,12 @@ jobs:
           tags: ${{ env.IMAGE }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          build-args: |
+            VITE_API_BASE_URL=
+            VITE_COGNITO_DOMAIN=${{ vars.VITE_COGNITO_DOMAIN }}
+            VITE_COGNITO_CLIENT_ID=${{ vars.VITE_COGNITO_CLIENT_ID }}
+            VITE_COGNITO_REDIRECT_URI=${{ vars.VITE_COGNITO_REDIRECT_URI }}
+            VITE_STRIPE_PUBLISHABLE_KEY=${{ vars.VITE_STRIPE_PUBLISHABLE_KEY }}
 
       # Runs before the restart, so for a few seconds the old binary sees the
       # new schema. Keep migrations backward-compatible (expand-then-contract).
@@ -286,6 +336,16 @@ jobs:
           echo "--- GET /products ---"
           if ! curl -fsS -o /dev/null -w 'status %{http_code}\n' localhost:8080/products; then
             echo "GET /products FAILED"
+            smoke_failed=1
+          fi
+
+          # The storefront is baked into this image, so a build that lost it
+          # would otherwise deploy green and serve a JSON 404 on every page.
+          # Checking for the mount point rather than just a 200 is what makes
+          # this catch an empty or half-copied bundle.
+          echo "--- GET / (storefront) ---"
+          if ! curl -fsS localhost:8080/ | grep -q 'id="root"'; then
+            echo "storefront did not render; the bundle is missing from the image"
             smoke_failed=1
           fi
 

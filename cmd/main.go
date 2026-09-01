@@ -58,6 +58,14 @@ func main() {
 			eventPollOverlap:     env.GetDuration("STRIPE_EVENT_POLL_OVERLAP", 2*time.Minute),
 			eventInitialLookback: env.GetDuration("STRIPE_EVENT_INITIAL_LOOKBACK", time.Hour),
 		},
+
+		// Unset in production: the frontend is served by this process, so
+		// nothing is cross-origin. Set it to the Vite dev server's origin
+		// (http://localhost:5173) when running the two separately.
+		corsAllowedOrigins: env.GetStringSlice("CORS_ALLOWED_ORIGINS"),
+		// Where `npm run build` leaves the bundle. The container image sets
+		// this to /srv/web; a missing directory just means no frontend.
+		webDistDir: env.GetString("WEB_DIST_DIR", "./web/dist"),
 	}
 
 	// structured (text based) logger as global logger

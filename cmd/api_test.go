@@ -130,6 +130,9 @@ var routeAccess = map[string]access{
 	"DELETE /orders/{id}":        authenticated,
 	"POST /orders/{id}/checkout": authenticated,
 	"POST /products":             vendorOnly,
+	// The storefront. Public by necessity — it is the page that renders the
+	// sign-in button, so requiring a token to fetch it could not work.
+	"GET /*": public,
 }
 
 func TestEveryRouteIsClassified(t *testing.T) {
@@ -207,6 +210,10 @@ func TestRouteAccessIsEnforced(t *testing.T) {
 		{"DELETE /orders/{id}", http.MethodDelete, "/orders/" + missingID, ""},
 		{"POST /orders/{id}/checkout", http.MethodPost, "/orders/" + missingID + "/checkout", ""},
 		{"POST /webhooks/stripe", http.MethodPost, "/webhooks/stripe", `{}`},
+		// No frontend is built during tests, so this 404s — which is exactly
+		// what the gate assertion needs: anything other than 401/403 counts as
+		// having been let through.
+		{"GET /*", http.MethodGet, "/some-client-side-route", ""},
 	}
 
 	if len(probes) != len(routeAccess) {
