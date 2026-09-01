@@ -1,6 +1,7 @@
 package env
 
 import (
+	"slices"
 	"testing"
 	"time"
 )
@@ -98,4 +99,49 @@ func TestMustGetString(t *testing.T) {
 		}()
 		MustGetString("DOORBUST_TEST_REQUIRED_EMPTY")
 	})
+}
+
+func TestGetStringSlice(t *testing.T) {
+	const key = "DOORBUST_TEST_ORIGINS"
+
+	tests := []struct {
+		name  string
+		set   bool
+		value string
+		want  []string
+	}{
+		// Nil rather than []string{""}: callers treat "no entries" as an off
+		// switch, and a list holding one empty string would read as configured.
+		{name: "unset is nil", want: nil},
+		{name: "empty is nil", set: true, value: "", want: nil},
+		{name: "only separators is nil", set: true, value: " , ,", want: nil},
+		{name: "single", set: true, value: "http://localhost:5173", want: []string{"http://localhost:5173"}},
+		{
+			name:  "multiple",
+			set:   true,
+			value: "http://localhost:5173,https://app.example",
+			want:  []string{"http://localhost:5173", "https://app.example"},
+		},
+		// .env values are unquoted and hand-edited, so stray spaces and a
+		// trailing comma are the normal case, not an abuse.
+		{
+			name:  "trims and drops blanks",
+			set:   true,
+			value: " http://a.test , https://b.test ,",
+			want:  []string{"http://a.test", "https://b.test"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.set {
+				t.Setenv(key, tt.value)
+			}
+
+			got := GetStringSlice(key)
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("GetStringSlice(%q) = %#v, want %#v", tt.value, got, tt.want)
+			}
+		})
+	}
 }

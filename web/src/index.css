@@ -1,0 +1,44 @@
+@import 'tailwindcss';
+
+/*
+ * The design tokens from the handoff artboard, verbatim. Emphasis in this
+ * design comes from weight, rules and the black fill — never from colour.
+ */
+@theme {
+  --color-ink: #0a0a0a;
+  --color-muted: #6b6b6b;
+  --color-faint: #9a9a9a;
+  --color-rule: #eae7e2;
+  --color-edge: #dedbd6;
+  --color-page: #f4f3f1;
+  --color-surface: #ffffff;
+
+  --font-sans: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, monospace;
+
+  /*
+   * "No radii, no shadows, no colour" is a rule of the design, so the scales
+   * that would let one slip in are removed outright rather than left available
+   * and merely unused. `rounded-md` and `shadow-lg` do not exist here, and
+   * reaching for one is a build error rather than a silent drift.
+   */
+  --radius-*: initial;
+  --shadow-*: initial;
+  --color-red-*: initial;
+  --color-green-*: initial;
+  --color-blue-*: initial;
+  --color-yellow-*: initial;
+}
+
+body {
+  margin: 0;
+  background: var(--color-page);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}

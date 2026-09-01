@@ -5,3 +5,10 @@ infra
 scripts
 deploy
 *.md
+# web/ IS part of the build context — the Dockerfile's node stage compiles it.
+# These two are not: node_modules is reinstalled from the lockfile by `npm ci`,
+# and dist is rebuilt. Without them the whole tree is uploaded on every build.
+web/node_modules
+web/dist
+web/.env
+web/.env.local

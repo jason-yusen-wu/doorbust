@@ -12,8 +12,21 @@ ssh_key="$infra_dir/deploy_key"
 ip="$(terraform -chdir="$infra_dir" output -raw public_ip)"
 ssh_opts=(-i "$ssh_key" -o StrictHostKeyChecking=accept-new)
 
+# The image carries the storefront too, and Vite inlines its configuration at
+# build time — so these must be passed here, not set on the container. They
+# mirror the repository variables the CI pipeline uses; unset ones simply build
+# a frontend with the Hosted UI disabled, which still serves and still browses.
+# Nothing secret belongs here: build args are visible in `docker history`.
+build_args=(
+  --build-arg "VITE_API_BASE_URL=${VITE_API_BASE_URL-}"
+  --build-arg "VITE_COGNITO_DOMAIN=${VITE_COGNITO_DOMAIN-}"
+  --build-arg "VITE_COGNITO_CLIENT_ID=${VITE_COGNITO_CLIENT_ID-}"
+  --build-arg "VITE_COGNITO_REDIRECT_URI=${VITE_COGNITO_REDIRECT_URI-}"
+  --build-arg "VITE_STRIPE_PUBLISHABLE_KEY=${VITE_STRIPE_PUBLISHABLE_KEY-}"
+)
+
 echo "==> building image (linux/amd64 — the EC2 AMI is x86_64, regardless of what architecture you're building on)"
-docker build --platform linux/amd64 -t doorbust:latest "$repo_root"
+docker build --platform linux/amd64 "${build_args[@]}" -t doorbust:latest "$repo_root"
 
 echo "==> shipping image to ec2-user@$ip"
 docker save doorbust:latest | gzip | ssh "${ssh_opts[@]}" "ec2-user@$ip" 'gunzip | sudo docker load'
