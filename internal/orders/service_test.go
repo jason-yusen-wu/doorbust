@@ -4,100 +4,29 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	repo "github.com/jason-yusen-wu/doorbust/internal/adapters/postgresql/sqlc"
 	"github.com/jason-yusen-wu/doorbust/internal/auth"
+	"github.com/jason-yusen-wu/doorbust/internal/testsupport"
 )
 
-// These tests run against a real PostgreSQL. That is not incidental: the
+// These tests run against a real PostgreSQL, and that is not incidental: the
 // oversell guarantee lives in SQL — ReserveStock's `quantity - num_reserved
 // > 0` and the status guards on the orders table — and depends on row-level
 // locking under concurrent writers. A mocked repo.Querier would exercise none
-// of it and would pass no matter how broken the SQL was.
+// of it and would pass no matter how broken the queries were.
 //
-// CI provides TEST_DATABASE_URL alongside a postgres:17-alpine service
-// container; locally, point it at a scratch database (never a real one — the
-// tests write freely).
+// Each test gets its own database (testsupport.DB), so they run in parallel
+// and operations with global scope — the expiry sweep especially — can be
+// asserted to an exact count rather than "at least one".
 
-func testPool(t *testing.T) *pgxpool.Pool {
-	t.Helper()
-
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("TEST_DATABASE_URL not set; skipping database-backed tests")
-	}
-
-	pool, err := pgxpool.New(context.Background(), dsn)
-	if err != nil {
-		t.Fatalf("connect to test database: %v", err)
-	}
-	if err := pool.Ping(context.Background()); err != nil {
-		t.Fatalf("ping test database: %v", err)
-	}
-
-	t.Cleanup(pool.Close)
-	return pool
-}
-
-// seedProduct creates a product and its stock row, returning the product id.
-// Every test seeds its own so tests never contend with each other.
-func seedProduct(t *testing.T, pool *pgxpool.Pool, quantity int32) int64 {
-	t.Helper()
-
-	ctx := context.Background()
-	q := repo.New(pool)
-
-	product, err := q.CreateProduct(ctx, repo.CreateProductParams{
-		Name:         fmt.Sprintf("test-%s-%d", t.Name(), time.Now().UnixNano()),
-		PriceInCents: 1999,
-		// start_at is NOT NULL and the insert names it explicitly, so the
-		// column default never applies here.
-		StartAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
-	})
-	if err != nil {
-		t.Fatalf("seed product: %v", err)
-	}
-
-	if _, err := q.CreateStock(ctx, repo.CreateStockParams{
-		ProductID: product.ID,
-		Quantity:  quantity,
-	}); err != nil {
-		t.Fatalf("seed stock: %v", err)
-	}
-
-	return product.ID
-}
-
-func readStock(t *testing.T, pool *pgxpool.Pool, productID int64) repo.FindProductByIDRow {
-	t.Helper()
-
-	row, err := repo.New(pool).FindProductByID(context.Background(), productID)
-	if err != nil {
-		t.Fatalf("read stock: %v", err)
-	}
-	return row
-}
-
-// claimsFor builds a distinct caller identity per test buyer.
-func claimsFor(t *testing.T, n int) auth.Claims {
-	t.Helper()
-
-	unique := fmt.Sprintf("%s-%d-%d", t.Name(), n, time.Now().UnixNano())
-	return auth.Claims{
-		Subject: "sub-" + unique,
-		Email:   unique + "@example.test",
-	}
-}
-
-// fakeGateway stands in for Stripe. Payment-processor behaviour is not what
-// these tests are about; inventory integrity around it is.
+// fakeGateway stands in for Stripe. Payment-processor behaviour is covered at
+// the HTTP level in cmd; what matters here is inventory integrity around it.
 type fakeGateway struct {
 	seq  atomic.Int64
 	fail error
@@ -117,18 +46,30 @@ func newTestService(pool *pgxpool.Pool, ttl time.Duration) (Service, *fakeGatewa
 	return NewService(repo.New(pool), pool, gateway, ttl), gateway
 }
 
+// buyer builds a distinct caller identity. Claims are constructed directly
+// because the service layer never sees a token — token verification is covered
+// in internal/auth and cmd.
+func buyer(n int) auth.Claims {
+	return auth.Claims{
+		Subject: fmt.Sprintf("sub-buyer-%d", n),
+		Email:   fmt.Sprintf("buyer-%d@example.test", n),
+	}
+}
+
 // TestCreateOrderNeverOversells is the project's central claim: no matter how
 // many buyers reserve the same product at the same instant, stock cannot be
 // reserved past what exists.
 func TestCreateOrderNeverOversells(t *testing.T) {
-	pool := testPool(t)
+	t.Parallel()
+
+	pool := testsupport.DB(t)
 
 	const (
 		buyers = 50
 		stock  = 7
 	)
 
-	productID := seedProduct(t, pool, stock)
+	productID := testsupport.SeedProduct(t, pool, "doorbuster", 1999, stock)
 	service, _ := newTestService(pool, 15*time.Minute)
 
 	var (
@@ -146,7 +87,7 @@ func TestCreateOrderNeverOversells(t *testing.T) {
 			// rather than arriving in a queue.
 			<-start
 
-			_, err := service.CreateOrder(context.Background(), productID, claimsFor(t, i))
+			_, err := service.CreateOrder(context.Background(), productID, buyer(i))
 			switch {
 			case err == nil:
 				reserved.Add(1)
@@ -168,30 +109,21 @@ func TestCreateOrderNeverOversells(t *testing.T) {
 		t.Errorf("%d buyers got out-of-stock, want %d", got, buyers-stock)
 	}
 
-	final := readStock(t, pool, productID)
-	if final.NumReserved != stock {
-		t.Errorf("num_reserved = %d, want %d", final.NumReserved, stock)
-	}
-	if final.Quantity != stock {
-		t.Errorf("quantity = %d, want %d (reserving must not consume stock)", final.Quantity, stock)
-	}
-	// The CHECK constraint is the backstop; it should never have been what
-	// stopped an oversell.
-	if final.NumReserved > final.Quantity {
-		t.Fatalf("oversold: num_reserved %d > quantity %d", final.NumReserved, final.Quantity)
-	}
+	// Reserving holds stock without consuming it.
+	testsupport.AssertStock(t, pool, productID, stock, stock)
 }
 
-// TestConcurrentCancelReleasesOnce covers the new way num_reserved can be
+// TestConcurrentCancelReleasesOnce covers a way num_reserved can be
 // decremented. Without the status guard on CancelPendingOrder, racing cancels
 // would each release a unit and drive the counter negative.
 func TestConcurrentCancelReleasesOnce(t *testing.T) {
-	pool := testPool(t)
+	t.Parallel()
 
-	productID := seedProduct(t, pool, 1)
+	pool := testsupport.DB(t)
+	productID := testsupport.SeedProduct(t, pool, "cancel-race", 100, 1)
 	service, _ := newTestService(pool, 15*time.Minute)
 
-	claims := claimsFor(t, 0)
+	claims := buyer(0)
 	order, err := service.CreateOrder(context.Background(), productID, claims)
 	if err != nil {
 		t.Fatalf("reserve: %v", err)
@@ -222,26 +154,20 @@ func TestConcurrentCancelReleasesOnce(t *testing.T) {
 	if got := succeeded.Load(); got != 1 {
 		t.Errorf("%d cancels succeeded, want exactly 1", got)
 	}
-
-	final := readStock(t, pool, productID)
-	if final.NumReserved != 0 {
-		t.Errorf("num_reserved = %d after cancel, want 0", final.NumReserved)
-	}
-	if final.Quantity != 1 {
-		t.Errorf("quantity = %d, want 1 (a cancel must not consume stock)", final.Quantity)
-	}
+	testsupport.AssertStock(t, pool, productID, 1, 0)
 }
 
 // TestRedeliveredPaymentCommitsStockOnce is the webhook idempotency claim.
 // Stripe delivers at-least-once, so FulfillPayment is called repeatedly for
 // the same intent on purpose.
 func TestRedeliveredPaymentCommitsStockOnce(t *testing.T) {
-	pool := testPool(t)
+	t.Parallel()
 
-	productID := seedProduct(t, pool, 1)
+	pool := testsupport.DB(t)
+	productID := testsupport.SeedProduct(t, pool, "redelivery", 100, 1)
 	service, _ := newTestService(pool, 15*time.Minute)
 
-	claims := claimsFor(t, 0)
+	claims := buyer(0)
 	ctx := context.Background()
 
 	order, err := service.CreateOrder(ctx, productID, claims)
@@ -257,59 +183,99 @@ func TestRedeliveredPaymentCommitsStockOnce(t *testing.T) {
 		t.Error("checkout returned no client secret")
 	}
 
-	// Checkout must not have consumed stock — that is the whole point of the
-	// two halves.
-	afterCheckout := readStock(t, pool, productID)
-	if afterCheckout.Quantity != 1 || afterCheckout.NumReserved != 1 {
-		t.Fatalf("after checkout quantity=%d num_reserved=%d, want 1/1 (payment not yet confirmed)",
-			afterCheckout.Quantity, afterCheckout.NumReserved)
-	}
+	// Checkout must not consume stock — that is the point of the two halves.
+	testsupport.AssertStock(t, pool, productID, 1, 1)
 
 	const deliveries = 8
-	var wg sync.WaitGroup
-	start := make(chan struct{})
+	var (
+		failures atomic.Int64
+		wg       sync.WaitGroup
+		start    = make(chan struct{})
+	)
 
 	for range deliveries {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			<-start
-			// Errors are expected on all but one: the guard rejects the rest.
-			_ = service.FulfillPayment(context.Background(), result.PaymentIntentID)
+			if err := service.FulfillPayment(context.Background(), result.PaymentIntentID); err != nil {
+				failures.Add(1)
+				t.Errorf("redelivery reported an error: %v", err)
+			}
 		}()
 	}
 
 	close(start)
 	wg.Wait()
 
-	final := readStock(t, pool, productID)
-	if final.Quantity != 0 {
-		t.Errorf("quantity = %d after payment, want 0", final.Quantity)
+	// Every delivery must report success. Only one of them actually applies —
+	// the rest find the order already completed, which classifyUnfulfillable
+	// treats as a benign redelivery rather than an incident. Erroring on
+	// those would raise a false refund alarm on ordinary Stripe retries.
+	if got := failures.Load(); got != 0 {
+		t.Errorf("%d of %d redeliveries errored, want 0", got, deliveries)
 	}
-	if final.NumReserved != 0 {
-		t.Errorf("num_reserved = %d after payment, want 0", final.NumReserved)
-	}
+
+	// The real idempotency claim: stock moved exactly once regardless.
+	testsupport.AssertStock(t, pool, productID, 0, 0)
+	testsupport.AssertOrderStatus(t, pool, order.ID, StatusCompleted)
 }
 
-// TestSweeperReleasesExpiredReservation checks the expiry path end to end,
-// including the case the whole design has to be honest about: a payment that
-// succeeds after its reservation was already swept.
-func TestSweeperReleasesExpiredReservation(t *testing.T) {
-	pool := testPool(t)
+func TestFailPaymentReleasesStock(t *testing.T) {
+	t.Parallel()
 
-	productID := seedProduct(t, pool, 1)
-	// A negative TTL puts expires_at in the past, so the reservation is
-	// already expired the moment it is created.
-	service, _ := newTestService(pool, -time.Second)
+	pool := testsupport.DB(t)
+	productID := testsupport.SeedProduct(t, pool, "declined", 100, 1)
+	service, _ := newTestService(pool, 15*time.Minute)
 
-	claims := claimsFor(t, 0)
+	claims := buyer(0)
 	ctx := context.Background()
 
 	order, err := service.CreateOrder(ctx, productID, claims)
 	if err != nil {
 		t.Fatalf("reserve: %v", err)
 	}
+	result, err := service.Checkout(ctx, order.ID, claims)
+	if err != nil {
+		t.Fatalf("checkout: %v", err)
+	}
 
+	if err := service.FailPayment(ctx, result.PaymentIntentID); err != nil {
+		t.Fatalf("fail payment: %v", err)
+	}
+
+	testsupport.AssertOrderStatus(t, pool, order.ID, StatusFailed)
+	// A failed payment is not a sale: the unit goes back on sale untouched.
+	testsupport.AssertStock(t, pool, productID, 1, 0)
+
+	t.Run("redelivered failure releases at most once", func(t *testing.T) {
+		if err := service.FailPayment(ctx, result.PaymentIntentID); err != nil {
+			t.Errorf("second failure returned %v, want nil (already handled)", err)
+		}
+		testsupport.AssertStock(t, pool, productID, 1, 0)
+	})
+}
+
+// TestSweeperReleasesExpiredReservation checks the expiry path, including the
+// case the design has to be honest about: a payment that succeeds after its
+// reservation was already swept.
+func TestSweeperReleasesExpiredReservation(t *testing.T) {
+	t.Parallel()
+
+	pool := testsupport.DB(t)
+	productID := testsupport.SeedProduct(t, pool, "expiring", 100, 1)
+
+	// A negative TTL puts expires_at in the past, so the reservation is
+	// already expired the moment it is created — deterministic, no sleeping.
+	service, _ := newTestService(pool, -time.Second)
+
+	claims := buyer(0)
+	ctx := context.Background()
+
+	order, err := service.CreateOrder(ctx, productID, claims)
+	if err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
 	result, err := service.Checkout(ctx, order.ID, claims)
 	if err != nil {
 		t.Fatalf("checkout: %v", err)
@@ -319,42 +285,179 @@ func TestSweeperReleasesExpiredReservation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
-	if released < 1 {
-		t.Fatalf("sweep released %d reservations, want at least 1", released)
+	// An isolated database means this is exact rather than "at least one".
+	if released != 1 {
+		t.Fatalf("sweep released %d reservations, want exactly 1", released)
 	}
 
-	afterSweep := readStock(t, pool, productID)
-	if afterSweep.NumReserved != 0 {
-		t.Errorf("num_reserved = %d after sweep, want 0", afterSweep.NumReserved)
-	}
-	if afterSweep.Quantity != 1 {
-		t.Errorf("quantity = %d after sweep, want 1 (expiry must put the unit back on sale)", afterSweep.Quantity)
+	testsupport.AssertOrderStatus(t, pool, order.ID, StatusExpired)
+	testsupport.AssertStock(t, pool, productID, 1, 0)
+
+	t.Run("a second sweep finds nothing", func(t *testing.T) {
+		again, err := service.SweepExpired(ctx, 100)
+		if err != nil {
+			t.Fatalf("second sweep: %v", err)
+		}
+		if again != 0 {
+			t.Errorf("second sweep released %d, want 0", again)
+		}
+	})
+
+	t.Run("a late payment must not commit stock", func(t *testing.T) {
+		// Money moved, but the unit is back on sale and may already belong to
+		// someone else. This must not quietly complete, and must not report
+		// success — or the mismatch is invisible.
+		err := service.FulfillPayment(ctx, result.PaymentIntentID)
+		if err == nil {
+			t.Error("a payment for an expired order reported success; it needs to surface for refund")
+		}
+		if !errors.Is(err, ErrPaidButNotFulfillable) {
+			t.Errorf("got %v, want it to wrap ErrPaidButNotFulfillable", err)
+		}
+		testsupport.AssertStock(t, pool, productID, 1, 0)
+	})
+}
+
+func TestSweeperLeavesLiveReservationsAlone(t *testing.T) {
+	t.Parallel()
+
+	pool := testsupport.DB(t)
+	productID := testsupport.SeedProduct(t, pool, "not-yet-expired", 100, 1)
+	service, _ := newTestService(pool, time.Hour)
+
+	ctx := context.Background()
+	order, err := service.CreateOrder(ctx, productID, buyer(0))
+	if err != nil {
+		t.Fatalf("reserve: %v", err)
 	}
 
-	// The payment lands late. Money moved, but the unit is back on sale and
-	// may already belong to someone else, so this must NOT quietly commit
-	// stock — and it must not report success, or the mismatch is invisible.
-	err = service.FulfillPayment(ctx, result.PaymentIntentID)
-	if err == nil {
-		t.Error("a payment for an expired order reported success; it needs to surface for refund")
+	released, err := service.SweepExpired(ctx, 100)
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if released != 0 {
+		t.Errorf("swept %d live reservations, want 0", released)
 	}
 
-	afterLatePayment := readStock(t, pool, productID)
-	if afterLatePayment.Quantity != 1 || afterLatePayment.NumReserved != 0 {
-		t.Errorf("late payment changed stock to quantity=%d num_reserved=%d, want 1/0",
-			afterLatePayment.Quantity, afterLatePayment.NumReserved)
+	testsupport.AssertOrderStatus(t, pool, order.ID, StatusPending)
+	testsupport.AssertStock(t, pool, productID, 1, 1)
+}
+
+func TestCheckoutSurfacesGatewayFailure(t *testing.T) {
+	t.Parallel()
+
+	pool := testsupport.DB(t)
+	productID := testsupport.SeedProduct(t, pool, "gateway-down", 100, 1)
+	service, gateway := newTestService(pool, 15*time.Minute)
+
+	ctx := context.Background()
+	claims := buyer(0)
+
+	order, err := service.CreateOrder(ctx, productID, claims)
+	if err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+
+	gateway.fail = errors.New("stripe unavailable")
+
+	if _, err := service.Checkout(ctx, order.ID, claims); err == nil {
+		t.Fatal("expected checkout to fail when the gateway does")
+	}
+
+	// Nothing was charged, so nothing should have advanced: the order stays
+	// pending and keeps its reservation, leaving the buyer able to retry.
+	testsupport.AssertOrderStatus(t, pool, order.ID, StatusPending)
+	testsupport.AssertStock(t, pool, productID, 1, 1)
+
+	if got := testsupport.Order(t, pool, order.ID); got.StripePaymentIntentID.Valid {
+		t.Errorf("a payment intent was recorded despite the gateway failing: %q", got.StripePaymentIntentID.String)
 	}
 }
 
-// TestOwnershipIsEnforced guards the authorization half of the contract.
-func TestOwnershipIsEnforced(t *testing.T) {
-	pool := testPool(t)
+func TestListOrders(t *testing.T) {
+	t.Parallel()
 
-	productID := seedProduct(t, pool, 1)
+	pool := testsupport.DB(t)
+	productID := testsupport.SeedProduct(t, pool, "listed", 250, 10)
 	service, _ := newTestService(pool, 15*time.Minute)
 
-	owner := claimsFor(t, 0)
-	stranger := claimsFor(t, 1)
+	ctx := context.Background()
+	mine, theirs := buyer(1), buyer(2)
+
+	for range 3 {
+		if _, err := service.CreateOrder(ctx, productID, mine); err != nil {
+			t.Fatalf("reserve: %v", err)
+		}
+	}
+	if _, err := service.CreateOrder(ctx, productID, theirs); err != nil {
+		t.Fatalf("reserve for other buyer: %v", err)
+	}
+
+	t.Run("returns only the caller's orders", func(t *testing.T) {
+		got, err := service.ListOrders(ctx, mine, 20, 0)
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		if len(got) != 3 {
+			t.Fatalf("got %d orders, want 3", len(got))
+		}
+		for _, o := range got {
+			if o.ProductName != "listed" {
+				t.Errorf("product_name = %q, want the joined product name", o.ProductName)
+			}
+		}
+	})
+
+	t.Run("newest first", func(t *testing.T) {
+		got, err := service.ListOrders(ctx, mine, 20, 0)
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		for i := 1; i < len(got); i++ {
+			if got[i-1].ID < got[i].ID {
+				t.Errorf("orders are not newest-first: %d before %d", got[i-1].ID, got[i].ID)
+			}
+		}
+	})
+
+	t.Run("honours limit and offset", func(t *testing.T) {
+		page, err := service.ListOrders(ctx, mine, 2, 0)
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		if len(page) != 2 {
+			t.Errorf("got %d orders, want 2", len(page))
+		}
+
+		rest, err := service.ListOrders(ctx, mine, 2, 2)
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		if len(rest) != 1 {
+			t.Errorf("got %d orders on page 2, want 1", len(rest))
+		}
+	})
+
+	t.Run("a customer with no orders gets an empty list", func(t *testing.T) {
+		// Must not error: a signed-up user who has never ordered is normal.
+		got, err := service.ListOrders(ctx, buyer(99), 20, 0)
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		if len(got) != 0 {
+			t.Errorf("got %d orders, want 0", len(got))
+		}
+	})
+}
+
+func TestOwnershipIsEnforced(t *testing.T) {
+	t.Parallel()
+
+	pool := testsupport.DB(t)
+	productID := testsupport.SeedProduct(t, pool, "owned", 100, 1)
+	service, _ := newTestService(pool, 15*time.Minute)
+
+	owner, stranger := buyer(1), buyer(2)
 	ctx := context.Background()
 
 	order, err := service.CreateOrder(ctx, productID, owner)
@@ -374,5 +477,36 @@ func TestOwnershipIsEnforced(t *testing.T) {
 
 	if _, err := service.GetOrder(ctx, order.ID, owner); err != nil {
 		t.Errorf("GetOrder by the owner failed: %v", err)
+	}
+}
+
+// Ownership prefers the immutable Cognito subject over the mutable email. A
+// customer row created before cognito_sub existed falls back to email, and
+// that fallback must keep working until every row is backfilled.
+func TestOwnershipFallsBackToEmailForLegacyRows(t *testing.T) {
+	t.Parallel()
+
+	pool := testsupport.DB(t)
+	productID := testsupport.SeedProduct(t, pool, "legacy", 100, 1)
+	service, _ := newTestService(pool, 15*time.Minute)
+
+	ctx := context.Background()
+
+	// A row with no subject, as migration 00005 leaves pre-existing rows.
+	legacy := testsupport.SeedCustomer(t, pool, "legacy@example.test", "")
+	if legacy.CognitoSub.Valid {
+		t.Fatal("expected a customer with no cognito_sub")
+	}
+
+	order, err := service.CreateOrder(ctx, productID, auth.Claims{Email: "legacy@example.test"})
+	if err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+
+	if _, err := service.GetOrder(ctx, order.ID, auth.Claims{Email: "legacy@example.test"}); err != nil {
+		t.Errorf("owner matched by email was rejected: %v", err)
+	}
+	if _, err := service.GetOrder(ctx, order.ID, auth.Claims{Email: "someone-else@example.test"}); !errors.Is(err, ErrForbidden) {
+		t.Errorf("a different email was accepted; got %v", err)
 	}
 }

@@ -63,6 +63,17 @@ SET num_reserved = num_reserved - 1
 WHERE product_id = $1 AND num_reserved > 0
 RETURNING *;
 
+-- name: FindCustomerBySub :one
+-- Looked up before any insert is attempted. The Cognito subject is the stable
+-- identity; email is not, and a user who changes it in Cognito would otherwise
+-- reach the insert below with a new email, conflict on cognito_sub rather than
+-- email, and be permanently unable to use the app.
+SELECT * FROM customers WHERE cognito_sub = $1;
+
+-- name: UpdateCustomerEmail :one
+-- Adopts a changed email onto the row the subject already owns.
+UPDATE customers SET email = $2 WHERE id = $1 RETURNING *;
+
 -- name: LinkCustomer :one
 -- Bridges a Cognito identity to a customers row, and backfills cognito_sub on
 -- rows created before that column existed.

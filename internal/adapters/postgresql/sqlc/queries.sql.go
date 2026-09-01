@@ -282,6 +282,26 @@ func (q *Queries) FailOrder(ctx context.Context, id int64) (Order, error) {
 	return i, err
 }
 
+const findCustomerBySub = `-- name: FindCustomerBySub :one
+SELECT id, email, created_at, cognito_sub FROM customers WHERE cognito_sub = $1
+`
+
+// Looked up before any insert is attempted. The Cognito subject is the stable
+// identity; email is not, and a user who changes it in Cognito would otherwise
+// reach the insert below with a new email, conflict on cognito_sub rather than
+// email, and be permanently unable to use the app.
+func (q *Queries) FindCustomerBySub(ctx context.Context, cognitoSub pgtype.Text) (Customer, error) {
+	row := q.db.QueryRow(ctx, findCustomerBySub, cognitoSub)
+	var i Customer
+	err := row.Scan(
+		&i.ID,
+		&i.Email,
+		&i.CreatedAt,
+		&i.CognitoSub,
+	)
+	return i, err
+}
+
 const findOrderByID = `-- name: FindOrderByID :one
 SELECT o.id, o.customer_id, o.product_id, o.status, o.created_at, o.total_in_cents, o.expires_at, o.stripe_payment_intent_id, c.email AS customer_email, c.cognito_sub AS customer_cognito_sub
 FROM orders o
@@ -715,6 +735,28 @@ func (q *Queries) ReserveStock(ctx context.Context, productID int64) (Stock, err
 		&i.ProductID,
 		&i.Quantity,
 		&i.NumReserved,
+	)
+	return i, err
+}
+
+const updateCustomerEmail = `-- name: UpdateCustomerEmail :one
+UPDATE customers SET email = $2 WHERE id = $1 RETURNING id, email, created_at, cognito_sub
+`
+
+type UpdateCustomerEmailParams struct {
+	ID    int64  `json:"id"`
+	Email string `json:"email"`
+}
+
+// Adopts a changed email onto the row the subject already owns.
+func (q *Queries) UpdateCustomerEmail(ctx context.Context, arg UpdateCustomerEmailParams) (Customer, error) {
+	row := q.db.QueryRow(ctx, updateCustomerEmail, arg.ID, arg.Email)
+	var i Customer
+	err := row.Scan(
+		&i.ID,
+		&i.Email,
+		&i.CreatedAt,
+		&i.CognitoSub,
 	)
 	return i, err
 }

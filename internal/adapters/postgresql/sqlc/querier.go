@@ -53,6 +53,11 @@ type Querier interface {
 	// The payment_intent.payment_failed path. Guarded so a redelivered failure
 	// releases stock at most once.
 	FailOrder(ctx context.Context, id int64) (Order, error)
+	// Looked up before any insert is attempted. The Cognito subject is the stable
+	// identity; email is not, and a user who changes it in Cognito would otherwise
+	// reach the insert below with a new email, conflict on cognito_sub rather than
+	// email, and be permanently unable to use the app.
+	FindCustomerBySub(ctx context.Context, cognitoSub pgtype.Text) (Customer, error)
 	// Joins the owning customer's identity so callers can check ownership without
 	// a second round trip. cognito_sub is preferred over email for that check;
 	// it is NULL only for customers who predate the column.
@@ -120,6 +125,8 @@ type Querier interface {
 	// untouched by the payment/expiry work so the contention strategy stays
 	// swappable (Redis counters, advisory locks, SERIALIZABLE) after profiling.
 	ReserveStock(ctx context.Context, productID int64) (Stock, error)
+	// Adopts a changed email onto the row the subject already owns.
+	UpdateCustomerEmail(ctx context.Context, arg UpdateCustomerEmailParams) (Customer, error)
 }
 
 var _ Querier = (*Queries)(nil)
