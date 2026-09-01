@@ -11,6 +11,64 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const cancelPendingOrder = `-- name: CancelPendingOrder :one
+UPDATE orders
+SET status = 'cancelled'
+WHERE id = $1 AND status = 'pending'
+RETURNING id, customer_id, product_id, status, created_at, total_in_cents, expires_at, stripe_payment_intent_id
+`
+
+// Backs DELETE /orders/{id}. Restricted to 'pending' on purpose: once an
+// order is 'awaiting_payment' a PaymentIntent exists and the customer may
+// still pay it, so cancelling would need a refund path. Those orders are left
+// to expire instead.
+func (q *Queries) CancelPendingOrder(ctx context.Context, id int64) (Order, error) {
+	row := q.db.QueryRow(ctx, cancelPendingOrder, id)
+	var i Order
+	err := row.Scan(
+		&i.ID,
+		&i.CustomerID,
+		&i.ProductID,
+		&i.Status,
+		&i.CreatedAt,
+		&i.TotalInCents,
+		&i.ExpiresAt,
+		&i.StripePaymentIntentID,
+	)
+	return i, err
+}
+
+const claimNextStripeEvent = `-- name: ClaimNextStripeEvent :one
+SELECT id, type, payload, received_at, processed_at, attempts, last_error, stripe_created_at FROM stripe_events
+WHERE processed_at IS NULL AND attempts < $1
+ORDER BY received_at
+LIMIT 1
+FOR UPDATE SKIP LOCKED
+`
+
+// One event per transaction: a poisoned payload then fails only itself
+// instead of rolling back a whole batch. SKIP LOCKED lets concurrent workers
+// (or a future second box) drain the queue without double-processing.
+//
+// The attempts cap is what stops an event that can never succeed from being
+// re-claimed every poll forever. Such rows stay unprocessed with last_error
+// set, which is the signal to go look at them.
+func (q *Queries) ClaimNextStripeEvent(ctx context.Context, maxAttempts int32) (StripeEvent, error) {
+	row := q.db.QueryRow(ctx, claimNextStripeEvent, maxAttempts)
+	var i StripeEvent
+	err := row.Scan(
+		&i.ID,
+		&i.Type,
+		&i.Payload,
+		&i.ReceivedAt,
+		&i.ProcessedAt,
+		&i.Attempts,
+		&i.LastError,
+		&i.StripeCreatedAt,
+	)
+	return i, err
+}
+
 const commitStock = `-- name: CommitStock :one
 UPDATE stock
 SET quantity = quantity - 1, num_reserved = num_reserved - 1
@@ -35,12 +93,16 @@ func (q *Queries) CommitStock(ctx context.Context, productID int64) (Stock, erro
 const completeOrder = `-- name: CompleteOrder :one
 UPDATE orders
 SET status = 'completed'
-WHERE id = $1 AND status = 'pending'
-RETURNING id, customer_id, product_id, status, created_at
+WHERE id = $1 AND status = 'awaiting_payment'
+RETURNING id, customer_id, product_id, status, created_at, total_in_cents, expires_at, stripe_payment_intent_id
 `
 
-// Guarded by status = 'pending' so a duplicate/concurrent checkout call can
-// only ever commit stock once for a given order.
+// Guarded by status = 'awaiting_payment' so a redelivered webhook can only
+// ever commit stock once for a given order. Stripe delivers at-least-once;
+// this WHERE clause is what makes that safe without a distributed lock.
+//
+// Note the guard is 'awaiting_payment', not 'pending': an order can only be
+// completed by a confirmed payment, never straight from reservation.
 func (q *Queries) CompleteOrder(ctx context.Context, id int64) (Order, error) {
 	row := q.db.QueryRow(ctx, completeOrder, id)
 	var i Order
@@ -50,23 +112,36 @@ func (q *Queries) CompleteOrder(ctx context.Context, id int64) (Order, error) {
 		&i.ProductID,
 		&i.Status,
 		&i.CreatedAt,
+		&i.TotalInCents,
+		&i.ExpiresAt,
+		&i.StripePaymentIntentID,
 	)
 	return i, err
 }
 
 const createOrder = `-- name: CreateOrder :one
-INSERT INTO orders (customer_id, product_id)
-VALUES ($1, $2)
-RETURNING id, customer_id, product_id, status, created_at
+INSERT INTO orders (customer_id, product_id, total_in_cents, expires_at)
+VALUES ($1, $2, $3, $4)
+RETURNING id, customer_id, product_id, status, created_at, total_in_cents, expires_at, stripe_payment_intent_id
 `
 
 type CreateOrderParams struct {
-	CustomerID int64 `json:"customer_id"`
-	ProductID  int64 `json:"product_id"`
+	CustomerID   int64              `json:"customer_id"`
+	ProductID    int64              `json:"product_id"`
+	TotalInCents int32              `json:"total_in_cents"`
+	ExpiresAt    pgtype.Timestamptz `json:"expires_at"`
 }
 
+// total_in_cents snapshots the product price at reserve time so a later price
+// change can't move the amount charged. expires_at bounds how long the
+// reservation may hold stock.
 func (q *Queries) CreateOrder(ctx context.Context, arg CreateOrderParams) (Order, error) {
-	row := q.db.QueryRow(ctx, createOrder, arg.CustomerID, arg.ProductID)
+	row := q.db.QueryRow(ctx, createOrder,
+		arg.CustomerID,
+		arg.ProductID,
+		arg.TotalInCents,
+		arg.ExpiresAt,
+	)
 	var i Order
 	err := row.Scan(
 		&i.ID,
@@ -74,6 +149,9 @@ func (q *Queries) CreateOrder(ctx context.Context, arg CreateOrderParams) (Order
 		&i.ProductID,
 		&i.Status,
 		&i.CreatedAt,
+		&i.TotalInCents,
+		&i.ExpiresAt,
+		&i.StripePaymentIntentID,
 	)
 	return i, err
 }
@@ -126,40 +204,107 @@ func (q *Queries) CreateStock(ctx context.Context, arg CreateStockParams) (Stock
 	return i, err
 }
 
-const findOrCreateCustomer = `-- name: FindOrCreateCustomer :one
-INSERT INTO customers (email)
-VALUES ($1)
-ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
-RETURNING id, email, created_at
+const expireOrders = `-- name: ExpireOrders :many
+UPDATE orders
+SET status = 'expired'
+WHERE id IN (
+    SELECT id FROM orders
+    WHERE status IN ('pending', 'awaiting_payment')
+      AND expires_at IS NOT NULL
+      AND expires_at < now()
+    ORDER BY expires_at
+    LIMIT $1
+    FOR UPDATE SKIP LOCKED
+)
+RETURNING id, customer_id, product_id, status, created_at, total_in_cents, expires_at, stripe_payment_intent_id
 `
 
-// Upsert keyed on the email unique constraint, so concurrent orders from a new
-// customer's first request can't race into duplicate customer rows.
-func (q *Queries) FindOrCreateCustomer(ctx context.Context, email string) (Customer, error) {
-	row := q.db.QueryRow(ctx, findOrCreateCustomer, email)
-	var i Customer
-	err := row.Scan(&i.ID, &i.Email, &i.CreatedAt)
+// The sweeper's claim-and-mark. Driven by our own clock and our own table,
+// deliberately independent of Stripe: if Stripe never calls back, stock must
+// still come back on sale.
+//
+// FOR UPDATE SKIP LOCKED makes this safe to run from more than one process —
+// a second sweeper skips rows already claimed rather than blocking on them.
+// The caller must ReleaseStock for every returned row in this same
+// transaction, so an order can never be marked expired without its unit
+// being returned.
+func (q *Queries) ExpireOrders(ctx context.Context, limit int32) ([]Order, error) {
+	rows, err := q.db.Query(ctx, expireOrders, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Order
+	for rows.Next() {
+		var i Order
+		if err := rows.Scan(
+			&i.ID,
+			&i.CustomerID,
+			&i.ProductID,
+			&i.Status,
+			&i.CreatedAt,
+			&i.TotalInCents,
+			&i.ExpiresAt,
+			&i.StripePaymentIntentID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const failOrder = `-- name: FailOrder :one
+UPDATE orders
+SET status = 'failed'
+WHERE id = $1 AND status = 'awaiting_payment'
+RETURNING id, customer_id, product_id, status, created_at, total_in_cents, expires_at, stripe_payment_intent_id
+`
+
+// The payment_intent.payment_failed path. Guarded so a redelivered failure
+// releases stock at most once.
+func (q *Queries) FailOrder(ctx context.Context, id int64) (Order, error) {
+	row := q.db.QueryRow(ctx, failOrder, id)
+	var i Order
+	err := row.Scan(
+		&i.ID,
+		&i.CustomerID,
+		&i.ProductID,
+		&i.Status,
+		&i.CreatedAt,
+		&i.TotalInCents,
+		&i.ExpiresAt,
+		&i.StripePaymentIntentID,
+	)
 	return i, err
 }
 
 const findOrderByID = `-- name: FindOrderByID :one
-SELECT o.id, o.customer_id, o.product_id, o.status, o.created_at, c.email AS customer_email
+SELECT o.id, o.customer_id, o.product_id, o.status, o.created_at, o.total_in_cents, o.expires_at, o.stripe_payment_intent_id, c.email AS customer_email, c.cognito_sub AS customer_cognito_sub
 FROM orders o
 JOIN customers c ON c.id = o.customer_id
 WHERE o.id = $1
 `
 
 type FindOrderByIDRow struct {
-	ID            int64              `json:"id"`
-	CustomerID    int64              `json:"customer_id"`
-	ProductID     int64              `json:"product_id"`
-	Status        string             `json:"status"`
-	CreatedAt     pgtype.Timestamptz `json:"created_at"`
-	CustomerEmail string             `json:"customer_email"`
+	ID                    int64              `json:"id"`
+	CustomerID            int64              `json:"customer_id"`
+	ProductID             int64              `json:"product_id"`
+	Status                string             `json:"status"`
+	CreatedAt             pgtype.Timestamptz `json:"created_at"`
+	TotalInCents          int32              `json:"total_in_cents"`
+	ExpiresAt             pgtype.Timestamptz `json:"expires_at"`
+	StripePaymentIntentID pgtype.Text        `json:"stripe_payment_intent_id"`
+	CustomerEmail         string             `json:"customer_email"`
+	CustomerCognitoSub    pgtype.Text        `json:"customer_cognito_sub"`
 }
 
-// Joins the owning customer's email so callers can check ownership without a
-// second round trip.
+// Joins the owning customer's identity so callers can check ownership without
+// a second round trip. cognito_sub is preferred over email for that check;
+// it is NULL only for customers who predate the column.
 func (q *Queries) FindOrderByID(ctx context.Context, id int64) (FindOrderByIDRow, error) {
 	row := q.db.QueryRow(ctx, findOrderByID, id)
 	var i FindOrderByIDRow
@@ -169,7 +314,50 @@ func (q *Queries) FindOrderByID(ctx context.Context, id int64) (FindOrderByIDRow
 		&i.ProductID,
 		&i.Status,
 		&i.CreatedAt,
+		&i.TotalInCents,
+		&i.ExpiresAt,
+		&i.StripePaymentIntentID,
 		&i.CustomerEmail,
+		&i.CustomerCognitoSub,
+	)
+	return i, err
+}
+
+const findOrderByPaymentIntentID = `-- name: FindOrderByPaymentIntentID :one
+SELECT o.id, o.customer_id, o.product_id, o.status, o.created_at, o.total_in_cents, o.expires_at, o.stripe_payment_intent_id, c.email AS customer_email, c.cognito_sub AS customer_cognito_sub
+FROM orders o
+JOIN customers c ON c.id = o.customer_id
+WHERE o.stripe_payment_intent_id = $1
+`
+
+type FindOrderByPaymentIntentIDRow struct {
+	ID                    int64              `json:"id"`
+	CustomerID            int64              `json:"customer_id"`
+	ProductID             int64              `json:"product_id"`
+	Status                string             `json:"status"`
+	CreatedAt             pgtype.Timestamptz `json:"created_at"`
+	TotalInCents          int32              `json:"total_in_cents"`
+	ExpiresAt             pgtype.Timestamptz `json:"expires_at"`
+	StripePaymentIntentID pgtype.Text        `json:"stripe_payment_intent_id"`
+	CustomerEmail         string             `json:"customer_email"`
+	CustomerCognitoSub    pgtype.Text        `json:"customer_cognito_sub"`
+}
+
+// The Stripe webhook's only handle back to an order.
+func (q *Queries) FindOrderByPaymentIntentID(ctx context.Context, stripePaymentIntentID pgtype.Text) (FindOrderByPaymentIntentIDRow, error) {
+	row := q.db.QueryRow(ctx, findOrderByPaymentIntentID, stripePaymentIntentID)
+	var i FindOrderByPaymentIntentIDRow
+	err := row.Scan(
+		&i.ID,
+		&i.CustomerID,
+		&i.ProductID,
+		&i.Status,
+		&i.CreatedAt,
+		&i.TotalInCents,
+		&i.ExpiresAt,
+		&i.StripePaymentIntentID,
+		&i.CustomerEmail,
+		&i.CustomerCognitoSub,
 	)
 	return i, err
 }
@@ -206,6 +394,150 @@ func (q *Queries) FindProductByID(ctx context.Context, id int64) (FindProductByI
 		&i.NumReserved,
 	)
 	return i, err
+}
+
+const insertStripeEvent = `-- name: InsertStripeEvent :execrows
+INSERT INTO stripe_events (id, type, payload, stripe_created_at)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (id) DO NOTHING
+`
+
+type InsertStripeEventParams struct {
+	ID              string             `json:"id"`
+	Type            string             `json:"type"`
+	Payload         []byte             `json:"payload"`
+	StripeCreatedAt pgtype.Timestamptz `json:"stripe_created_at"`
+}
+
+// The entry point for both delivery paths — the webhook handler and the event
+// poller. id is Stripe's own evt_... identifier, so ON CONFLICT DO NOTHING
+// turns at-least-once delivery into exactly-once processing, and makes it safe
+// to run both paths at the same time or to re-scan an overlapping window.
+// Returns 0 rows when the event was already recorded, which callers log as a
+// duplicate rather than an error.
+func (q *Queries) InsertStripeEvent(ctx context.Context, arg InsertStripeEventParams) (int64, error) {
+	result, err := q.db.Exec(ctx, insertStripeEvent,
+		arg.ID,
+		arg.Type,
+		arg.Payload,
+		arg.StripeCreatedAt,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const latestStripeEventCreatedAt = `-- name: LatestStripeEventCreatedAt :one
+SELECT max(stripe_created_at)::timestamptz FROM stripe_events
+`
+
+// The poller's resume point, in Stripe's clock.
+//
+// Reading it from the table on every tick rather than holding it in memory is
+// what makes the poller crash-safe and stateless: after a restart, a deploy,
+// or an outage of any length it resumes from the last event actually stored.
+// Returns NULL when nothing has been recorded yet, which the caller turns into
+// a bounded initial lookback so a fresh box doesn't replay all of history.
+func (q *Queries) LatestStripeEventCreatedAt(ctx context.Context) (pgtype.Timestamptz, error) {
+	row := q.db.QueryRow(ctx, latestStripeEventCreatedAt)
+	var column_1 pgtype.Timestamptz
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
+const linkCustomer = `-- name: LinkCustomer :one
+INSERT INTO customers (email, cognito_sub)
+VALUES ($1, $2)
+ON CONFLICT (email) DO UPDATE
+    SET cognito_sub = COALESCE(customers.cognito_sub, EXCLUDED.cognito_sub)
+RETURNING id, email, created_at, cognito_sub
+`
+
+type LinkCustomerParams struct {
+	Email      string      `json:"email"`
+	CognitoSub pgtype.Text `json:"cognito_sub"`
+}
+
+// Bridges a Cognito identity to a customers row, and backfills cognito_sub on
+// rows created before that column existed.
+//
+// Still upserts on email (the pre-existing unique constraint) so no data
+// migration is needed. COALESCE keeps the first sub ever recorded rather than
+// letting a later caller overwrite it. This is the expand phase: once every
+// row has a sub, the conflict target can flip to cognito_sub, which closes
+// the hole that email is mutable in Cognito and sub is not.
+func (q *Queries) LinkCustomer(ctx context.Context, arg LinkCustomerParams) (Customer, error) {
+	row := q.db.QueryRow(ctx, linkCustomer, arg.Email, arg.CognitoSub)
+	var i Customer
+	err := row.Scan(
+		&i.ID,
+		&i.Email,
+		&i.CreatedAt,
+		&i.CognitoSub,
+	)
+	return i, err
+}
+
+const listOrdersByCustomer = `-- name: ListOrdersByCustomer :many
+SELECT o.id, o.customer_id, o.product_id, o.status, o.created_at, o.total_in_cents, o.expires_at, o.stripe_payment_intent_id, p.name AS product_name, p.price_in_cents
+FROM orders o
+JOIN products p ON p.id = o.product_id
+WHERE o.customer_id = $1
+ORDER BY o.created_at DESC
+LIMIT $2 OFFSET $3
+`
+
+type ListOrdersByCustomerParams struct {
+	CustomerID int64 `json:"customer_id"`
+	Limit      int32 `json:"limit"`
+	Offset     int32 `json:"offset"`
+}
+
+type ListOrdersByCustomerRow struct {
+	ID                    int64              `json:"id"`
+	CustomerID            int64              `json:"customer_id"`
+	ProductID             int64              `json:"product_id"`
+	Status                string             `json:"status"`
+	CreatedAt             pgtype.Timestamptz `json:"created_at"`
+	TotalInCents          int32              `json:"total_in_cents"`
+	ExpiresAt             pgtype.Timestamptz `json:"expires_at"`
+	StripePaymentIntentID pgtype.Text        `json:"stripe_payment_intent_id"`
+	ProductName           string             `json:"product_name"`
+	PriceInCents          int32              `json:"price_in_cents"`
+}
+
+// Backs GET /orders. Joins the product name so a list view doesn't need N+1
+// follow-up requests.
+func (q *Queries) ListOrdersByCustomer(ctx context.Context, arg ListOrdersByCustomerParams) ([]ListOrdersByCustomerRow, error) {
+	rows, err := q.db.Query(ctx, listOrdersByCustomer, arg.CustomerID, arg.Limit, arg.Offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListOrdersByCustomerRow
+	for rows.Next() {
+		var i ListOrdersByCustomerRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.CustomerID,
+			&i.ProductID,
+			&i.Status,
+			&i.CreatedAt,
+			&i.TotalInCents,
+			&i.ExpiresAt,
+			&i.StripePaymentIntentID,
+			&i.ProductName,
+			&i.PriceInCents,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listProducts = `-- name: ListProducts :many
@@ -265,6 +597,103 @@ func (q *Queries) ListProducts(ctx context.Context, arg ListProductsParams) ([]L
 	return items, nil
 }
 
+const markOrderAwaitingPayment = `-- name: MarkOrderAwaitingPayment :one
+UPDATE orders
+SET status = 'awaiting_payment', stripe_payment_intent_id = $2, expires_at = $3
+WHERE id = $1 AND status = 'pending'
+RETURNING id, customer_id, product_id, status, created_at, total_in_cents, expires_at, stripe_payment_intent_id
+`
+
+type MarkOrderAwaitingPaymentParams struct {
+	ID                    int64              `json:"id"`
+	StripePaymentIntentID pgtype.Text        `json:"stripe_payment_intent_id"`
+	ExpiresAt             pgtype.Timestamptz `json:"expires_at"`
+}
+
+// Checkout's half: records the PaymentIntent and hands the order to Stripe.
+// Guarded on 'pending' so two concurrent checkouts can't attach two intents
+// to one order — the loser sees no rows and is rejected.
+func (q *Queries) MarkOrderAwaitingPayment(ctx context.Context, arg MarkOrderAwaitingPaymentParams) (Order, error) {
+	row := q.db.QueryRow(ctx, markOrderAwaitingPayment, arg.ID, arg.StripePaymentIntentID, arg.ExpiresAt)
+	var i Order
+	err := row.Scan(
+		&i.ID,
+		&i.CustomerID,
+		&i.ProductID,
+		&i.Status,
+		&i.CreatedAt,
+		&i.TotalInCents,
+		&i.ExpiresAt,
+		&i.StripePaymentIntentID,
+	)
+	return i, err
+}
+
+const markStripeEventFailed = `-- name: MarkStripeEventFailed :exec
+UPDATE stripe_events
+SET attempts = attempts + 1, last_error = $2
+WHERE id = $1
+`
+
+type MarkStripeEventFailedParams struct {
+	ID        string      `json:"id"`
+	LastError pgtype.Text `json:"last_error"`
+}
+
+// Leaves processed_at NULL so the event is retried on the next poll.
+func (q *Queries) MarkStripeEventFailed(ctx context.Context, arg MarkStripeEventFailedParams) error {
+	_, err := q.db.Exec(ctx, markStripeEventFailed, arg.ID, arg.LastError)
+	return err
+}
+
+const markStripeEventProcessed = `-- name: MarkStripeEventProcessed :exec
+UPDATE stripe_events
+SET processed_at = now(), attempts = attempts + 1, last_error = $2
+WHERE id = $1
+`
+
+type MarkStripeEventProcessedParams struct {
+	ID        string      `json:"id"`
+	LastError pgtype.Text `json:"last_error"`
+}
+
+// last_error is NULL for a clean success. It is set — with processed_at still
+// stamped — for an event that can never succeed no matter how often it is
+// retried, such as a payment that arrived for an order the sweeper already
+// expired. Retrying those forever would spin the worker; leaving the message
+// behind is what makes them findable.
+func (q *Queries) MarkStripeEventProcessed(ctx context.Context, arg MarkStripeEventProcessedParams) error {
+	_, err := q.db.Exec(ctx, markStripeEventProcessed, arg.ID, arg.LastError)
+	return err
+}
+
+const releaseStock = `-- name: ReleaseStock :one
+UPDATE stock
+SET num_reserved = num_reserved - 1
+WHERE product_id = $1 AND num_reserved > 0
+RETURNING id, product_id, quantity, num_reserved
+`
+
+// The other way a reservation ends: cancelled, payment failed, or expired.
+// Puts the unit back on sale without touching quantity. Guarded on
+// num_reserved > 0 so a double release can't drive the counter negative.
+//
+// Always call this in the same transaction as the orders-table guard that
+// authorized it (CancelPendingOrder / FailOrder / ExpireOrders). That guard
+// is what makes the release happen at most once per order; this WHERE clause
+// is only the backstop.
+func (q *Queries) ReleaseStock(ctx context.Context, productID int64) (Stock, error) {
+	row := q.db.QueryRow(ctx, releaseStock, productID)
+	var i Stock
+	err := row.Scan(
+		&i.ID,
+		&i.ProductID,
+		&i.Quantity,
+		&i.NumReserved,
+	)
+	return i, err
+}
+
 const reserveStock = `-- name: ReserveStock :one
 UPDATE stock
 SET num_reserved = num_reserved + 1
@@ -274,6 +703,10 @@ RETURNING id, product_id, quantity, num_reserved
 
 // Atomic check-and-increment: only succeeds while quantity - num_reserved > 0,
 // so concurrent callers can never over-reserve a product's stock.
+//
+// This statement is the project's core correctness claim. Deliberately left
+// untouched by the payment/expiry work so the contention strategy stays
+// swappable (Redis counters, advisory locks, SERIALIZABLE) after profiling.
 func (q *Queries) ReserveStock(ctx context.Context, productID int64) (Stock, error) {
 	row := q.db.QueryRow(ctx, reserveStock, productID)
 	var i Stock

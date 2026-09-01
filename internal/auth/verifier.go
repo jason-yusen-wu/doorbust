@@ -39,10 +39,19 @@ func (v *Verifier) Verify(ctx context.Context, rawIDToken string) (Claims, error
 
 	var body struct {
 		Email string `json:"email"`
+		// Cognito puts group membership in the ID token under this claim. It
+		// is absent entirely for a user in no groups, which unmarshals to a
+		// nil slice — the zero value already means "no groups", so no special
+		// case is needed here.
+		//
+		// Because it rides in the token, membership changes only take effect
+		// on the *next* token Cognito issues; an existing session keeps its
+		// old groups until it refreshes.
+		Groups []string `json:"cognito:groups"`
 	}
 	if err := idToken.Claims(&body); err != nil {
 		return Claims{}, err
 	}
 
-	return Claims{Subject: idToken.Subject, Email: body.Email}, nil
+	return Claims{Subject: idToken.Subject, Email: body.Email, Groups: body.Groups}, nil
 }

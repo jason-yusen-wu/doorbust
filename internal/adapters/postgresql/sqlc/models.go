@@ -9,17 +9,21 @@ import (
 )
 
 type Customer struct {
-	ID        int64              `json:"id"`
-	Email     string             `json:"email"`
-	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	ID         int64              `json:"id"`
+	Email      string             `json:"email"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+	CognitoSub pgtype.Text        `json:"cognito_sub"`
 }
 
 type Order struct {
-	ID         int64              `json:"id"`
-	CustomerID int64              `json:"customer_id"`
-	ProductID  int64              `json:"product_id"`
-	Status     string             `json:"status"`
-	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+	ID                    int64              `json:"id"`
+	CustomerID            int64              `json:"customer_id"`
+	ProductID             int64              `json:"product_id"`
+	Status                string             `json:"status"`
+	CreatedAt             pgtype.Timestamptz `json:"created_at"`
+	TotalInCents          int32              `json:"total_in_cents"`
+	ExpiresAt             pgtype.Timestamptz `json:"expires_at"`
+	StripePaymentIntentID pgtype.Text        `json:"stripe_payment_intent_id"`
 }
 
 type Product struct {
@@ -35,4 +39,15 @@ type Stock struct {
 	ProductID   int64 `json:"product_id"`
 	Quantity    int32 `json:"quantity"`
 	NumReserved int32 `json:"num_reserved"`
+}
+
+type StripeEvent struct {
+	ID              string             `json:"id"`
+	Type            string             `json:"type"`
+	Payload         []byte             `json:"payload"`
+	ReceivedAt      pgtype.Timestamptz `json:"received_at"`
+	ProcessedAt     pgtype.Timestamptz `json:"processed_at"`
+	Attempts        int32              `json:"attempts"`
+	LastError       pgtype.Text        `json:"last_error"`
+	StripeCreatedAt pgtype.Timestamptz `json:"stripe_created_at"`
 }
