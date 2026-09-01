@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -39,7 +40,40 @@ type Poller struct {
 	// initialLookback bounds the very first poll, when the inbox is empty, so
 	// a fresh database doesn't replay Stripe's entire retained history.
 	initialLookback time.Duration
+
+	// lastSuccess is the unix time of the most recent successful poll, read
+	// by the readiness endpoint. Atomic because it is written by the poller
+	// goroutine and read by request handlers.
+	lastSuccess atomic.Int64
+	// startedAt bounds how long "has not succeeded yet" stays acceptable.
+	startedAt time.Time
 }
+
+// LastSuccess reports when the poller last completed a poll without error, or
+// the zero time if it never has.
+//
+// This is what makes "Stripe is reachable and the key is valid" observable
+// from outside the process. Without it, a poller failing every tick — a
+// revoked key, a network block — is invisible until orders quietly stop
+// completing.
+func (p *Poller) LastSuccess() time.Time {
+	unix := p.lastSuccess.Load()
+	if unix == 0 {
+		return time.Time{}
+	}
+	return time.Unix(unix, 0)
+}
+
+// Interval is the configured poll period, used to judge staleness.
+func (p *Poller) Interval() time.Duration { return p.interval }
+
+// StartedAt is when the poller was constructed.
+//
+// Readiness needs it to distinguish "has not polled yet" from "has never
+// managed to poll". Without it, a poller failing every single tick — the shape
+// of an invalid or revoked API key — would report "starting" forever and look
+// healthy, which is exactly the condition the check exists to catch.
+func (p *Poller) StartedAt() time.Time { return p.startedAt }
 
 // eventLister is the slice of the Stripe client this poller needs. Declared
 // here as an interface — the same way internal/orders declares PaymentGateway
@@ -56,6 +90,7 @@ func NewPoller(repo repo.Querier, events eventLister, interval, overlap, initial
 		interval:        interval,
 		overlap:         overlap,
 		initialLookback: initialLookback,
+		startedAt:       time.Now(),
 	}
 }
 
@@ -93,6 +128,12 @@ func (p *Poller) pollOnce(ctx context.Context) {
 		}
 		return
 	}
+
+	// Only a clean poll counts. A partial one that hit an error mid-page has
+	// already returned above, so readiness reflects genuine reachability
+	// rather than merely "the goroutine is alive".
+	p.lastSuccess.Store(time.Now().Unix())
+
 	if inserted > 0 {
 		slog.Info("recorded stripe events", "inserted", inserted, "fetched", fetched)
 	}

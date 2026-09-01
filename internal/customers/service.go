@@ -10,7 +10,6 @@ package customers
 import (
 	"context"
 
-	"github.com/jackc/pgx/v5/pgtype"
 	repo "github.com/jason-yusen-wu/doorbust/internal/adapters/postgresql/sqlc"
 	"github.com/jason-yusen-wu/doorbust/internal/auth"
 )
@@ -30,12 +29,9 @@ func NewService(repo repo.Querier) Service {
 	return &svc{repo: repo}
 }
 
-// GetOrCreate is idempotent by construction: LinkCustomer is an upsert, so
-// concurrent first-requests from the same user can't race into duplicate
-// rows, and a repeat call is just a read that also backfills cognito_sub.
+// GetOrCreate is idempotent, safe against concurrent first-requests, and
+// tolerant of a Cognito email change. See Link for why that takes more than a
+// single upsert.
 func (s *svc) GetOrCreate(ctx context.Context, claims auth.Claims) (repo.Customer, error) {
-	return s.repo.LinkCustomer(ctx, repo.LinkCustomerParams{
-		Email:      claims.Email,
-		CognitoSub: pgtype.Text{String: claims.Subject, Valid: claims.Subject != ""},
-	})
+	return Link(ctx, s.repo, claims)
 }

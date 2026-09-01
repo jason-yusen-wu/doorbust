@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	repo "github.com/jason-yusen-wu/doorbust/internal/adapters/postgresql/sqlc"
 	"github.com/jason-yusen-wu/doorbust/internal/auth"
+	"github.com/jason-yusen-wu/doorbust/internal/customers"
 )
 
 // business logic lives here
@@ -129,11 +130,11 @@ func (s *svc) ListOrders(ctx context.Context, claims auth.Claims, limit, offset 
 	})
 }
 
+// linkCustomer resolves the caller to a customers row. It delegates rather
+// than upserting inline because the correct version has to cope with two
+// unique constraints on that table — see customers.Link.
 func (s *svc) linkCustomer(ctx context.Context, q repo.Querier, claims auth.Claims) (repo.Customer, error) {
-	return q.LinkCustomer(ctx, repo.LinkCustomerParams{
-		Email:      claims.Email,
-		CognitoSub: pgtype.Text{String: claims.Subject, Valid: claims.Subject != ""},
-	})
+	return customers.Link(ctx, q, claims)
 }
 
 // CreateOrder is the reserve half of the buy flow: it finds/creates the
@@ -308,7 +309,19 @@ func (s *svc) FulfillPayment(ctx context.Context, paymentIntentID string) error 
 			// behind the same zero-row result: a benign webhook redelivery
 			// for an order already completed, versus a payment that landed
 			// after the sweeper released the stock.
-			return classifyUnfulfillable(existing)
+			//
+			// Classify on a FRESH read, never on `existing`. Under concurrent
+			// redelivery — which Stripe's at-least-once guarantee makes
+			// routine — the losing callers blocked on the row lock and only
+			// re-evaluated the guard once the winner committed, so their
+			// snapshot still says 'awaiting_payment'. Judging by it would
+			// report an ordinary retry as a payment needing a refund, burying
+			// the genuine cases in false alarms.
+			current, refreshErr := q.FindOrderByPaymentIntentID(ctx, pgtype.Text{String: paymentIntentID, Valid: true})
+			if refreshErr != nil {
+				return refreshErr
+			}
+			return classifyUnfulfillable(current)
 		}
 		return err
 	}

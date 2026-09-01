@@ -20,6 +20,7 @@ import (
 	"github.com/jason-yusen-wu/doorbust/internal/orders"
 	"github.com/jason-yusen-wu/doorbust/internal/payments"
 	"github.com/jason-yusen-wu/doorbust/internal/products"
+	"github.com/stripe/stripe-go/v83"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -36,6 +37,11 @@ func (app *application) mount() http.Handler {
 	queries := repo.New(app.db)
 
 	// endpoints
+	//
+	// /health is liveness: it proves the process started and bound the port,
+	// nothing more. Deliberately left touching no dependency, because the
+	// deploy's restart check relies on it answering even while the app is
+	// still settling.
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("all good"))
 	})
@@ -45,7 +51,13 @@ func (app *application) mount() http.Handler {
 	r.Get("/products", productHandler.ListProducts)
 	r.Get("/products/{id}", productHandler.GetProduct)
 
-	gateway := payments.NewStripeGateway(app.config.stripe.secretKey, app.config.stripe.currency)
+	// stripeClientOptions is empty in production; tests set it to point the
+	// client at a stub server.
+	gateway := payments.NewStripeGateway(
+		app.config.stripe.secretKey,
+		app.config.stripe.currency,
+		app.stripeClientOptions...,
+	)
 	orderService := orders.NewService(queries, app.db, gateway, app.config.orders.reservationTTL)
 	orderHandler := orders.NewHandler(orderService)
 
@@ -103,19 +115,25 @@ func (app *application) mount() http.Handler {
 	//
 	// Disabled by setting the interval to zero, which is what a local run
 	// using `stripe listen` against /webhooks/stripe wants.
+	var poller *payments.Poller
 	if app.config.payments.eventPollInterval > 0 {
+		poller = payments.NewPoller(
+			queries, gateway.Events(),
+			app.config.payments.eventPollInterval,
+			app.config.payments.eventPollOverlap,
+			app.config.payments.eventInitialLookback,
+		)
 		app.background = append(app.background, backgroundJob{
 			name: "stripe-poller",
-			run: payments.NewPoller(
-				queries, gateway.Events(),
-				app.config.payments.eventPollInterval,
-				app.config.payments.eventPollOverlap,
-				app.config.payments.eventInitialLookback,
-			).Run,
+			run:  poller.Run,
 		})
 	} else {
 		slog.Warn("stripe event poller disabled; events must arrive via the webhook endpoint")
 	}
+
+	// Readiness, unlike /health, actually touches the dependencies. Registered
+	// after the poller exists so it can report on it.
+	r.Get("/health/ready", app.readyHandler(poller))
 
 	return r
 }
@@ -195,6 +213,11 @@ type application struct {
 	db         *pgxpool.Pool // shared, concurrency-safe connection pool
 	auth       *auth.Verifier
 	background []backgroundJob
+
+	// stripeClientOptions is empty in production. Tests set it so mount()
+	// builds a gateway pointed at a stub server instead of live Stripe,
+	// which is what makes the checkout path testable through the real router.
+	stripeClientOptions []stripe.ClientOption
 }
 
 type config struct {

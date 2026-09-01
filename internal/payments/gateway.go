@@ -23,9 +23,16 @@ type StripeGateway struct {
 	currency string
 }
 
-func NewStripeGateway(secretKey, currency string) *StripeGateway {
+// NewStripeGateway builds a gateway against Stripe's live API. The variadic
+// options exist so tests can point the client at a stub HTTP server via
+// stripe.WithBackends; production passes none.
+//
+// Stubbing at the HTTP layer rather than behind the PaymentGateway interface
+// is what lets tests assert the request we actually send — amount, currency,
+// idempotency key, metadata — instead of only that some method was called.
+func NewStripeGateway(secretKey, currency string, opts ...stripe.ClientOption) *StripeGateway {
 	return &StripeGateway{
-		client:   stripe.NewClient(secretKey),
+		client:   stripe.NewClient(secretKey, opts...),
 		currency: currency,
 	}
 }

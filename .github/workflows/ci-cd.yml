@@ -109,12 +109,40 @@ jobs:
           chmod +x "$RUNNER_TEMP/bin/goose"
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
 
+      # The suite builds and clones its own template database, so this only
+      # has to leave a reachable server behind. Kept because `goose up` here
+      # also proves the migrations apply through the CLI, which is what the
+      # deploy job uses.
       - name: Migrate test database
         run: goose up
 
       # -race matters here: the whole point of the suite is concurrent access.
+      # -shuffle=on catches order dependence, which per-test database isolation
+      # is what makes survivable. -coverpkg=./... is required or the HTTP tests
+      # in cmd credit none of their coverage to the packages they exercise.
+      # -count=1 defeats the test cache, which `setup-go` restores between
+      # runs: without it a green result can come from a previous commit's
+      # cached run rather than this one's code.
       - name: go test
-        run: go test -race ./...
+        run: |
+          go test -race -shuffle=on -count=1 -timeout=10m \
+            -coverpkg=./... -coverprofile=coverage.out ./...
+
+      # Per-package floors rather than one repo-wide number: a global figure is
+      # dominated by generated sqlc code and cmd wiring, so it can be met while
+      # the logic deciding whether stock is oversold goes untested.
+      - name: Coverage floors
+        run: ./scripts/check-coverage.sh coverage.out
+
+      - name: Coverage summary
+        if: always()
+        run: |
+          {
+            echo '### Coverage'
+            echo '```'
+            ./scripts/check-coverage.sh coverage.out || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   deploy:
     name: deploy
@@ -218,6 +246,7 @@ jobs:
           docker tag "\$IMAGE" doorbust:latest
           systemctl restart doorbust
 
+          # Liveness first: the process is up and bound to the port.
           for i in \$(seq 1 15); do
             if curl -fsS localhost:8080/health; then
               echo "; health OK after \$i attempt(s)"
@@ -230,6 +259,52 @@ jobs:
             fi
             sleep 2
           done
+
+          # Smoke tests. These run on the box because the security group admits
+          # only var.allowed_cidr, so a GitHub runner cannot reach :8080.
+          #
+          # All read-only: no writes, no inventory consumed. The full purchase
+          # flow is covered pre-merge by the contract suite against a real
+          # database, so buying something here would add ~40s to every deploy
+          # and put Stripe's uptime in the deploy gate for signal we already
+          # have.
+          smoke_failed=0
+
+          # /health is static and touches nothing, so it stays green even when
+          # every query is broken. Readiness pings the database and reports the
+          # Stripe poller's last successful poll — a revoked key or a stalled
+          # poller shows up here and nowhere else.
+          echo "--- readiness ---"
+          if ! curl -fsS localhost:8080/health/ready; then
+            echo "readiness check FAILED"
+            smoke_failed=1
+          fi
+          echo
+
+          # Exercises pgxpool and a real query end to end: catches the whole
+          # "app is up but the DB layer is broken" class.
+          echo "--- GET /products ---"
+          if ! curl -fsS -o /dev/null -w 'status %{http_code}\n' localhost:8080/products; then
+            echo "GET /products FAILED"
+            smoke_failed=1
+          fi
+
+          # An unauthenticated call to a protected route must be refused. If
+          # this ever returns 200, the auth middleware is not mounted.
+          echo "--- GET /orders without a token ---"
+          code="\$(curl -s -o /dev/null -w '%{http_code}' localhost:8080/orders)"
+          echo "status \$code"
+          if [ "\$code" != "401" ]; then
+            echo "protected route returned \$code, expected 401 — AUTH IS NOT ENFORCED"
+            smoke_failed=1
+          fi
+
+          if [ "\$smoke_failed" != "0" ]; then
+            echo "post-deploy smoke tests failed"
+            journalctl -u doorbust -n 50 --no-pager
+            exit 1
+          fi
+          echo "smoke tests passed"
 
           docker image prune -af --filter "until=24h"
           EOF
