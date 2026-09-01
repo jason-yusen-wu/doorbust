@@ -4,11 +4,20 @@
 #
 # Cognito identifiers come from .env (COGNITO_ISSUER_URL, COGNITO_CLIENT_ID)
 # rather than being hardcoded here, so there's one place to change if the
-# pool changes. The app client's secret is read only from the environment —
-# never pass it as an argument, it would land in your shell history.
+# pool changes.
+#
+# COGNITO_CLIENT_SECRET is OPTIONAL, and for the current client id it should be
+# unset. The app client the API verifies against (`doorbust-web`) is a PUBLIC
+# client — it has no secret, because the SPA signs in with authorization code +
+# PKCE from a browser, and Cognito rejects a SECRET_HASH from a client that has
+# no secret. The variable is still honoured for the older confidential client
+# (`doorbust`), which is why the branch exists.
+#
+# When it IS needed, read it only from the environment — never pass it as an
+# argument, it would land in your shell history.
 #
 # Usage:
-#   COGNITO_CLIENT_SECRET='...' ./scripts/with-env.sh ./scripts/get-test-token.sh <username> <password>
+#   ./scripts/with-env.sh ./scripts/get-test-token.sh <username> <password>
 set -euo pipefail
 
 username="${1:-}"
@@ -16,10 +25,9 @@ password="${2:-}"
 
 : "${COGNITO_ISSUER_URL:?not set — run this via ./scripts/with-env.sh so .env is loaded}"
 : "${COGNITO_CLIENT_ID:?not set — run this via ./scripts/with-env.sh so .env is loaded}"
-: "${COGNITO_CLIENT_SECRET:?set COGNITO_CLIENT_SECRET in your environment first}"
 
 if [ -z "$username" ] || [ -z "$password" ]; then
-	echo "usage: COGNITO_CLIENT_SECRET='...' ./scripts/with-env.sh $0 <username> <password>" >&2
+	echo "usage: ./scripts/with-env.sh $0 <username> <password>" >&2
 	exit 1
 fi
 
@@ -31,12 +39,19 @@ if [ "$region" = "$COGNITO_ISSUER_URL" ]; then
 	exit 1
 fi
 
-secret_hash="$(printf '%s' "${username}${COGNITO_CLIENT_ID}" | openssl dgst -sha256 -hmac "$COGNITO_CLIENT_SECRET" -binary | base64)"
+# A public client takes USERNAME/PASSWORD alone; sending a SECRET_HASH to one
+# is an error rather than harmless extra input, so the parameter is omitted
+# entirely unless a secret was supplied.
+auth_params="USERNAME=${username},PASSWORD=${password}"
+if [ -n "${COGNITO_CLIENT_SECRET:-}" ]; then
+	secret_hash="$(printf '%s' "${username}${COGNITO_CLIENT_ID}" | openssl dgst -sha256 -hmac "$COGNITO_CLIENT_SECRET" -binary | base64)"
+	auth_params="${auth_params},SECRET_HASH=${secret_hash}"
+fi
 
 aws cognito-idp initiate-auth \
 	--region "$region" \
 	--client-id "$COGNITO_CLIENT_ID" \
 	--auth-flow USER_PASSWORD_AUTH \
-	--auth-parameters USERNAME="$username",PASSWORD="$password",SECRET_HASH="$secret_hash" \
+	--auth-parameters "$auth_params" \
 	--query 'AuthenticationResult.IdToken' \
 	--output text
