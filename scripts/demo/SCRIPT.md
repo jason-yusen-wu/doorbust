@@ -9,9 +9,14 @@ doesn't sound like you.
 ## Before you record
 
 ```bash
-scripts/demo/seed.sh     # reset the catalogue
-make server              # storefront + API on localhost:8080
+scripts/demo/seed.sh       # reset the catalogue
+scripts/demo/server.sh     # start cleanly on localhost:8080
 ```
+
+Use `server.sh` rather than `make server`. It stops whatever is already holding
+the port first — `go run` leaves a child process behind that keeps answering
+after you think you've stopped it, which is how you end up filming a server
+running yesterday's settings.
 
 Two browser windows side by side. Sign in as `demo-alice` in one and
 `demo-bob` in the other — sessions are per-tab, so two ordinary windows keep
@@ -138,8 +143,7 @@ and retake.*
 **Do:** restart with a short fuse:
 
 ```bash
-pkill -f "exe/cmd"; pkill -f "go run ./cmd"
-RESERVATION_TTL=45s RESERVATION_SWEEP_INTERVAL=10s make server
+scripts/demo/server.sh --short-ttl
 ```
 
 > Last thing about that hold. What if you reserve something and just… wander
@@ -201,6 +205,6 @@ Handy for framing shots:
 | Both buyers got the unit | Clicks too far apart. `scripts/demo/seed.sh`, retake. |
 | Catalogue looks wrong | `scripts/demo/seed.sh` |
 | Raw JSON on screen | You reloaded on `/orders` — navigate by clicking instead. |
-| Settings not applying | Old server still on :8080 — `pkill -f "exe/cmd"` |
+| Settings not applying, or the site looks stale/down | A leftover server still holds :8080. `scripts/demo/server.sh` clears it and restarts. |
 | Order stuck confirming | Stripe poll runs every 5s. Give it a beat. |
 | Sign-in page won't load | See the Cognito managed-login note in `CLAUDE.md`. |

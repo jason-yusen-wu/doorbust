@@ -21,8 +21,15 @@ five-second "and it's really running on AWS" shot, not a place to film the flow.
 ```bash
 scripts/demo/build-frontend.sh   # builds the bundle for :8080 (leaves web/.env alone)
 scripts/demo/seed.sh             # loads the demo catalogue
-make server                      # API + storefront on :8080
+scripts/demo/server.sh           # API + storefront on :8080
 ```
+
+`server.sh` rather than `make server`: `go run` compiles to a binary in the Go
+build cache and execs it, and killing `go run` does not reliably take that child
+with it. It gets re-parented to init and carries on holding port 8080, so your
+next start dies with "address already in use" while the old server keeps
+answering — which looks like the site being down, or like your changes doing
+nothing. `server.sh` stops whatever holds the port, then starts.
 
 Open <http://localhost:8080>.
 
