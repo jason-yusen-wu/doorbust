@@ -118,6 +118,33 @@ type Querier interface {
 	// is what makes the release happen at most once per order; this WHERE clause
 	// is only the backstop.
 	ReleaseStock(ctx context.Context, productID int64) (Stock, error)
+	// The R2 arm: reserve + order insert as ONE statement, run with no explicit
+	// transaction and therefore implicitly atomic. Postgres holds the stock row's
+	// lock for server execution time only, with no client network at all inside the
+	// critical section — which is the entire point, and what makes this a
+	// structural fix rather than a tuning one. See ReserveStock above, whose
+	// comment has always promised this strategy stays swappable.
+	//
+	// Ordering between the CTE arms is guaranteed by data dependency, not by
+	// writing order: `priced` reads `reserved`, and the INSERT reads `priced`, so
+	// the UPDATE is fully materialised before either runs. A data-modifying CTE is
+	// always materialised, so this is not an optimiser-fence question.
+	//
+	// Concurrency is unchanged from the two-statement version. Under READ
+	// COMMITTED, an UPDATE that meets a row another transaction has locked waits
+	// for that transaction and then re-evaluates its WHERE against the *new* row
+	// version, so `quantity - num_reserved > 0` is re-checked after every winner
+	// commits. The stock table's CHECK (num_reserved <= quantity) is the backstop.
+	//
+	// ZERO ROWS IS AMBIGUOUS: it means "no such product" and "no unit free" alike,
+	// and the API contract distinguishes those (404 vs 409 — cmd/contract_test.go
+	// asserts both). The caller disambiguates on the failure path; see
+	// cteStrategy.Reserve.
+	//
+	// The explicit casts are not decoration: through INSERT ... SELECT out of a
+	// CTE, sqlc's parameter type inference is weaker than through VALUES and
+	// otherwise emits interface{} for the untyped arguments.
+	ReserveAndCreateOrder(ctx context.Context, arg ReserveAndCreateOrderParams) (Order, error)
 	// Atomic check-and-increment: only succeeds while quantity - num_reserved > 0,
 	// so concurrent callers can never over-reserve a product's stock.
 	//

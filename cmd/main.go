@@ -9,6 +9,7 @@ import (
 	"github.com/jason-yusen-wu/doorbust/internal/adapters/postgresql"
 	"github.com/jason-yusen-wu/doorbust/internal/auth"
 	"github.com/jason-yusen-wu/doorbust/internal/env"
+	"github.com/jason-yusen-wu/doorbust/internal/orders"
 )
 
 func main() {
@@ -44,6 +45,11 @@ func main() {
 			reservationTTL: env.GetDuration("RESERVATION_TTL", 15*time.Minute),
 			sweepInterval:  env.GetDuration("RESERVATION_SWEEP_INTERVAL", time.Minute),
 			sweepBatchSize: int32(env.GetInt("RESERVATION_SWEEP_BATCH", 100)),
+
+			// Which reserve arm to run. Defaults to the statement order this
+			// project shipped with, so behaviour is unchanged unless asked.
+			reserveStrategy: env.GetString("RESERVE_STRATEGY", orders.StrategyBaseline),
+			customerCache:   env.GetBool("CUSTOMER_CACHE", false),
 		},
 		payments: paymentsConfig{
 			pollInterval: env.GetDuration("STRIPE_POLL_INTERVAL", 5*time.Second),
@@ -66,6 +72,9 @@ func main() {
 		// Where `npm run build` leaves the bundle. The container image sets
 		// this to /srv/web; a missing directory just means no frontend.
 		webDistDir: env.GetString("WEB_DIST_DIR", "./web/dist"),
+
+		// On unless a benchmark turns it off. See config.logRequests.
+		logRequests: env.GetBool("LOG_REQUESTS", true),
 	}
 
 	// structured (text based) logger as global logger

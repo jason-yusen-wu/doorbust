@@ -714,6 +714,79 @@ func (q *Queries) ReleaseStock(ctx context.Context, productID int64) (Stock, err
 	return i, err
 }
 
+const reserveAndCreateOrder = `-- name: ReserveAndCreateOrder :one
+WITH reserved AS (
+    UPDATE stock
+    SET num_reserved = num_reserved + 1
+    WHERE product_id = $3::bigint
+      AND quantity - num_reserved > 0
+    RETURNING product_id
+),
+priced AS (
+    -- Joining ` + "`" + `reserved` + "`" + ` is what snapshots the price only on success, and what
+    -- makes a failed reserve produce no order row rather than an orphaned one.
+    SELECT p.id, p.price_in_cents
+    FROM products p
+    JOIN reserved r ON r.product_id = p.id
+)
+INSERT INTO orders (customer_id, product_id, total_in_cents, expires_at)
+SELECT
+    $1::bigint,
+    priced.id,
+    priced.price_in_cents,
+    $2::timestamptz
+FROM priced
+RETURNING id, customer_id, product_id, status, created_at, total_in_cents, expires_at, stripe_payment_intent_id
+`
+
+type ReserveAndCreateOrderParams struct {
+	CustomerID int64              `json:"customer_id"`
+	ExpiresAt  pgtype.Timestamptz `json:"expires_at"`
+	ProductID  int64              `json:"product_id"`
+}
+
+// The R2 arm: reserve + order insert as ONE statement, run with no explicit
+// transaction and therefore implicitly atomic. Postgres holds the stock row's
+// lock for server execution time only, with no client network at all inside the
+// critical section — which is the entire point, and what makes this a
+// structural fix rather than a tuning one. See ReserveStock above, whose
+// comment has always promised this strategy stays swappable.
+//
+// Ordering between the CTE arms is guaranteed by data dependency, not by
+// writing order: `priced` reads `reserved`, and the INSERT reads `priced`, so
+// the UPDATE is fully materialised before either runs. A data-modifying CTE is
+// always materialised, so this is not an optimiser-fence question.
+//
+// Concurrency is unchanged from the two-statement version. Under READ
+// COMMITTED, an UPDATE that meets a row another transaction has locked waits
+// for that transaction and then re-evaluates its WHERE against the *new* row
+// version, so `quantity - num_reserved > 0` is re-checked after every winner
+// commits. The stock table's CHECK (num_reserved <= quantity) is the backstop.
+//
+// ZERO ROWS IS AMBIGUOUS: it means "no such product" and "no unit free" alike,
+// and the API contract distinguishes those (404 vs 409 — cmd/contract_test.go
+// asserts both). The caller disambiguates on the failure path; see
+// cteStrategy.Reserve.
+//
+// The explicit casts are not decoration: through INSERT ... SELECT out of a
+// CTE, sqlc's parameter type inference is weaker than through VALUES and
+// otherwise emits interface{} for the untyped arguments.
+func (q *Queries) ReserveAndCreateOrder(ctx context.Context, arg ReserveAndCreateOrderParams) (Order, error) {
+	row := q.db.QueryRow(ctx, reserveAndCreateOrder, arg.CustomerID, arg.ExpiresAt, arg.ProductID)
+	var i Order
+	err := row.Scan(
+		&i.ID,
+		&i.CustomerID,
+		&i.ProductID,
+		&i.Status,
+		&i.CreatedAt,
+		&i.TotalInCents,
+		&i.ExpiresAt,
+		&i.StripePaymentIntentID,
+	)
+	return i, err
+}
+
 const reserveStock = `-- name: ReserveStock :one
 UPDATE stock
 SET num_reserved = num_reserved + 1

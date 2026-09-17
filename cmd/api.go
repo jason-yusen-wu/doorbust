@@ -32,7 +32,9 @@ func (app *application) mount() http.Handler {
 	// middleware
 	r.Use(middleware.RequestID) // rate limiting & pass request in context
 	r.Use(middleware.RealIP)    // rate limiting, analytics & tracing
-	r.Use(middleware.Logger)
+	if app.config.logRequests {
+		r.Use(middleware.Logger)
+	}
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(60 * time.Second))
 
@@ -80,7 +82,21 @@ func (app *application) mount() http.Handler {
 		app.config.stripe.currency,
 		app.stripeClientOptions...,
 	)
-	orderService := orders.NewService(queries, app.db, gateway, app.config.orders.reservationTTL)
+	// The reserve arm is chosen at boot and never changes for the life of the
+	// process, so a bad RESERVE_STRATEGY fails at startup like a bad DSN does
+	// rather than silently benchmarking the default.
+	var resolver customers.Resolver = customers.DirectResolver{}
+	if app.config.orders.customerCache {
+		resolver = &customers.CachedResolver{}
+	}
+	reserve, err := orders.StrategyByName(
+		app.config.orders.reserveStrategy, queries, app.db, resolver,
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	orderService := orders.NewService(queries, app.db, gateway, reserve, app.config.orders.reservationTTL)
 	orderHandler := orders.NewHandler(orderService)
 
 	customerService := customers.NewService(queries)
@@ -262,6 +278,12 @@ type config struct {
 	// webDistDir holds the built frontend. Missing is fine — the API serves
 	// without it.
 	webDistDir string
+
+	// logRequests mounts chi's per-request logger. On in normal operation; off
+	// for measurement runs, where a formatted, mutex-serialised write to stdout
+	// on every request is a global lock and a syscall sitting on the exact path
+	// being measured.
+	logRequests bool
 }
 
 type cognitoConfig struct {
@@ -283,6 +305,16 @@ type ordersConfig struct {
 	reservationTTL time.Duration
 	sweepInterval  time.Duration
 	sweepBatchSize int32
+
+	// reserveStrategy selects which arm of the contention experiment this
+	// process runs. Every arm is oversell-free; see orders.ReserveStrategy.
+	// The default only moves when a measurement justifies it, and the number
+	// gets recorded in CLAUDE.md when it does.
+	reserveStrategy string
+	// customerCache memoises cognito sub -> customers.id, taking the caller
+	// lookup off the reserve path (R1). Off by default: the cache is currently
+	// unbounded, which is fine for a benchmark and not for production.
+	customerCache bool
 }
 
 type paymentsConfig struct {

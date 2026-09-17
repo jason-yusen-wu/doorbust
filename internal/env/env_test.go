@@ -47,6 +47,42 @@ func TestGetInt(t *testing.T) {
 	}
 }
 
+func TestGetBool(t *testing.T) {
+	// The whole accepted vocabulary, because .env is hand-edited and these
+	// knobs get written as "1", "true" and "TRUE" by different people.
+	for _, truthy := range []string{"1", "t", "T", "true", "TRUE", "True"} {
+		t.Setenv("DOORBUST_TEST_BOOL", truthy)
+		if !GetBool("DOORBUST_TEST_BOOL", false) {
+			t.Errorf("%q did not read as true", truthy)
+		}
+	}
+
+	for _, falsy := range []string{"0", "f", "F", "false", "FALSE", "False"} {
+		t.Setenv("DOORBUST_TEST_BOOL", falsy)
+		if GetBool("DOORBUST_TEST_BOOL", true) {
+			t.Errorf("%q did not read as false", falsy)
+		}
+	}
+
+	if got := GetBool("DOORBUST_TEST_MISSING_BOOL", true); !got {
+		t.Error("missing key did not use the fallback")
+	}
+
+	// A false value must override a true fallback — LOG_REQUESTS=false is how
+	// a benchmark run takes chi's logger off the measured path, and silently
+	// ignoring it would leave the logger mounted and the numbers wrong.
+	t.Setenv("DOORBUST_TEST_OFF", "false")
+	if GetBool("DOORBUST_TEST_OFF", true) {
+		t.Error("an explicit false did not override a true fallback")
+	}
+
+	// Silent fallback on a bad value, matching GetInt and GetDuration.
+	t.Setenv("DOORBUST_TEST_BAD_BOOL", "yes")
+	if got := GetBool("DOORBUST_TEST_BAD_BOOL", true); !got {
+		t.Error("unparseable value did not use the fallback")
+	}
+}
+
 func TestGetDuration(t *testing.T) {
 	t.Setenv("DOORBUST_TEST_DURATION", "90s")
 	if got := GetDuration("DOORBUST_TEST_DURATION", time.Minute); got != 90*time.Second {

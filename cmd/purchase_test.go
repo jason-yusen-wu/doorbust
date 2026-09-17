@@ -182,7 +182,10 @@ func drainWorker(t *testing.T, h *harness) {
 
 	worker := payments.NewWorker(
 		repo.New(h.db), h.db,
-		orders.NewService(repo.New(h.db), h.db, nil, 15*time.Minute),
+		// Neither the gateway nor the reserve strategy is reachable from the
+		// worker: it only ever calls FulfillPayment and FailPayment, which
+		// touch the orders and stock tables directly.
+		orders.NewService(repo.New(h.db), h.db, nil, nil, 15*time.Minute),
 		time.Millisecond, 5,
 	)
 

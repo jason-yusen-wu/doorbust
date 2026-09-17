@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	repo "github.com/jason-yusen-wu/doorbust/internal/adapters/postgresql/sqlc"
 	"github.com/jason-yusen-wu/doorbust/internal/auth"
+	"github.com/jason-yusen-wu/doorbust/internal/customers"
 	"github.com/jason-yusen-wu/doorbust/internal/testsupport"
 )
 
@@ -41,9 +42,22 @@ func (g *fakeGateway) CreatePaymentIntent(_ context.Context, p PaymentIntentPara
 	return PaymentIntent{ID: id, ClientSecret: id + "_secret"}, nil
 }
 
-func newTestService(pool *pgxpool.Pool, ttl time.Duration) (Service, *fakeGateway) {
+// newTestService builds the service against a real pool. The reserve arm is
+// variadic and defaults to baseline, so the many tests that do not care which
+// arm they run on stay unchanged; the concurrency tests pass one explicitly and
+// run against every arm.
+func newTestService(pool *pgxpool.Pool, ttl time.Duration, arm ...string) (Service, *fakeGateway) {
+	name := StrategyBaseline
+	if len(arm) > 0 {
+		name = arm[0]
+	}
+
 	gateway := &fakeGateway{}
-	return NewService(repo.New(pool), pool, gateway, ttl), gateway
+	reserve, err := StrategyByName(name, repo.New(pool), pool, customers.DirectResolver{})
+	if err != nil {
+		panic(err)
+	}
+	return NewService(repo.New(pool), pool, gateway, reserve, ttl), gateway
 }
 
 // buyer builds a distinct caller identity. Claims are constructed directly
@@ -62,55 +76,65 @@ func buyer(n int) auth.Claims {
 func TestCreateOrderNeverOversells(t *testing.T) {
 	t.Parallel()
 
-	pool := testsupport.DB(t)
+	// Every arm, not just the default. The arms exist to hold the stock row's
+	// lock for different lengths of time; an arm that is faster and oversells
+	// is not a result, it is a bug, and this is the test that says so. Adding a
+	// name to StrategyNames without making it pass here is not an option.
+	for _, arm := range StrategyNames() {
+		t.Run(arm, func(t *testing.T) {
+			t.Parallel()
 
-	const (
-		buyers = 50
-		stock  = 7
-	)
+			pool := testsupport.DB(t)
 
-	productID := testsupport.SeedProduct(t, pool, "doorbuster", 1999, stock)
-	service, _ := newTestService(pool, 15*time.Minute)
+			const (
+				buyers = 50
+				stock  = 7
+			)
 
-	var (
-		reserved   atomic.Int64
-		outOfStock atomic.Int64
-		wg         sync.WaitGroup
-		start      = make(chan struct{})
-	)
+			productID := testsupport.SeedProduct(t, pool, "doorbuster", 1999, stock)
+			service, _ := newTestService(pool, 15*time.Minute, arm)
 
-	for i := range buyers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			// Release everyone at once, so the reservations actually collide
-			// rather than arriving in a queue.
-			<-start
+			var (
+				reserved   atomic.Int64
+				outOfStock atomic.Int64
+				wg         sync.WaitGroup
+				start      = make(chan struct{})
+			)
 
-			_, err := service.CreateOrder(context.Background(), productID, buyer(i))
-			switch {
-			case err == nil:
-				reserved.Add(1)
-			case errors.Is(err, ErrOutOfStock):
-				outOfStock.Add(1)
-			default:
-				t.Errorf("unexpected error reserving: %v", err)
+			for i := range buyers {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					// Release everyone at once, so the reservations actually
+					// collide rather than arriving in a queue.
+					<-start
+
+					_, err := service.CreateOrder(context.Background(), productID, buyer(i))
+					switch {
+					case err == nil:
+						reserved.Add(1)
+					case errors.Is(err, ErrOutOfStock):
+						outOfStock.Add(1)
+					default:
+						t.Errorf("unexpected error reserving: %v", err)
+					}
+				}()
 			}
-		}()
-	}
 
-	close(start)
-	wg.Wait()
+			close(start)
+			wg.Wait()
 
-	if got := reserved.Load(); got != stock {
-		t.Errorf("reserved %d units, want exactly %d", got, stock)
-	}
-	if got := outOfStock.Load(); got != buyers-stock {
-		t.Errorf("%d buyers got out-of-stock, want %d", got, buyers-stock)
-	}
+			if got := reserved.Load(); got != stock {
+				t.Errorf("reserved %d units, want exactly %d", got, stock)
+			}
+			if got := outOfStock.Load(); got != buyers-stock {
+				t.Errorf("%d buyers got out-of-stock, want %d", got, buyers-stock)
+			}
 
-	// Reserving holds stock without consuming it.
-	testsupport.AssertStock(t, pool, productID, stock, stock)
+			// Reserving holds stock without consuming it.
+			testsupport.AssertStock(t, pool, productID, stock, stock)
+		})
+	}
 }
 
 // TestConcurrentCancelReleasesOnce covers a way num_reserved can be
@@ -119,42 +143,48 @@ func TestCreateOrderNeverOversells(t *testing.T) {
 func TestConcurrentCancelReleasesOnce(t *testing.T) {
 	t.Parallel()
 
-	pool := testsupport.DB(t)
-	productID := testsupport.SeedProduct(t, pool, "cancel-race", 100, 1)
-	service, _ := newTestService(pool, 15*time.Minute)
+	for _, arm := range StrategyNames() {
+		t.Run(arm, func(t *testing.T) {
+			t.Parallel()
 
-	claims := buyer(0)
-	order, err := service.CreateOrder(context.Background(), productID, claims)
-	if err != nil {
-		t.Fatalf("reserve: %v", err)
-	}
+			pool := testsupport.DB(t)
+			productID := testsupport.SeedProduct(t, pool, "cancel-race", 100, 1)
+			service, _ := newTestService(pool, 15*time.Minute, arm)
 
-	const cancels = 10
-	var (
-		succeeded atomic.Int64
-		wg        sync.WaitGroup
-		start     = make(chan struct{})
-	)
-
-	for range cancels {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-start
-
-			if _, err := service.CancelOrder(context.Background(), order.ID, claims); err == nil {
-				succeeded.Add(1)
+			claims := buyer(0)
+			order, err := service.CreateOrder(context.Background(), productID, claims)
+			if err != nil {
+				t.Fatalf("reserve: %v", err)
 			}
-		}()
-	}
 
-	close(start)
-	wg.Wait()
+			const cancels = 10
+			var (
+				succeeded atomic.Int64
+				wg        sync.WaitGroup
+				start     = make(chan struct{})
+			)
 
-	if got := succeeded.Load(); got != 1 {
-		t.Errorf("%d cancels succeeded, want exactly 1", got)
+			for range cancels {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					<-start
+
+					if _, err := service.CancelOrder(context.Background(), order.ID, claims); err == nil {
+						succeeded.Add(1)
+					}
+				}()
+			}
+
+			close(start)
+			wg.Wait()
+
+			if got := succeeded.Load(); got != 1 {
+				t.Errorf("%d cancels succeeded, want exactly 1", got)
+			}
+			testsupport.AssertStock(t, pool, productID, 1, 0)
+		})
 	}
-	testsupport.AssertStock(t, pool, productID, 1, 0)
 }
 
 // TestRedeliveredPaymentCommitsStockOnce is the webhook idempotency claim.
