@@ -26,6 +26,14 @@ type Order struct {
 	StripePaymentIntentID pgtype.Text        `json:"stripe_payment_intent_id"`
 }
 
+type OrderIdempotency struct {
+	CognitoSub  string             `json:"cognito_sub"`
+	IdemKey     string             `json:"idem_key"`
+	RequestHash string             `json:"request_hash"`
+	OrderID     pgtype.Int8        `json:"order_id"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+}
+
 type Product struct {
 	ID           int64              `json:"id"`
 	Name         string             `json:"name"`

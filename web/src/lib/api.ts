@@ -34,6 +34,8 @@ export interface RequestOptions {
   token?: string | null
   signal?: AbortSignal
   body?: unknown
+  /** Sent as the Idempotency-Key header. See createOrder. */
+  idempotencyKey?: string
 }
 
 async function request<T>(method: string, path: string, options: RequestOptions = {}): Promise<T> {
@@ -43,6 +45,9 @@ async function request<T>(method: string, path: string, options: RequestOptions 
   }
   if (options.body !== undefined) {
     headers['Content-Type'] = 'application/json'
+  }
+  if (options.idempotencyKey) {
+    headers['Idempotency-Key'] = options.idempotencyKey
   }
 
   const response = await fetch(`${API_BASE_URL}${path}`, {
@@ -116,12 +121,41 @@ export function getOrder(id: number, token: string, signal?: AbortSignal): Promi
 }
 
 /**
- * Reserve one unit. Rule 1: this is NOT idempotent — a retried call reserves a
- * second unit and creates a second order. Callers must guarantee one call per
- * click; see the in-flight ref in SaleDetail.
+ * Reserve one unit.
+ *
+ * Rule 1, amended: POST /orders is idempotent *per key*. Without an
+ * Idempotency-Key a retry still reserves a second unit — the server keeps the
+ * original behaviour for callers that send no key — so callers must pass one
+ * and must reuse the SAME key for what the user experienced as one attempt.
+ *
+ * Generating a fresh key per call would defeat the entire mechanism, which is
+ * why the key is an explicit parameter rather than something this function
+ * invents: only the caller knows where one user intent begins and ends.
  */
-export function createOrder(productId: number, token: string): Promise<Order> {
-  return request<Order>('POST', '/orders', { token, body: { product_id: productId } })
+export function createOrder(
+  productId: number,
+  token: string,
+  idempotencyKey: string,
+): Promise<Order> {
+  return request<Order>('POST', '/orders', {
+    token,
+    body: { product_id: productId },
+    idempotencyKey,
+  })
+}
+
+/**
+ * A key identifying one reserve attempt.
+ *
+ * crypto.randomUUID is available in every browser the app targets and in
+ * jsdom; the fallback keeps the function total rather than throwing in an
+ * exotic environment, since a weaker key is still vastly better than none.
+ */
+export function newIdempotencyKey(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID()
+  }
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`
 }
 
 /**

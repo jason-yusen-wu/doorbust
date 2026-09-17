@@ -33,9 +33,12 @@ RETURNING *;
 -- Atomic check-and-increment: only succeeds while quantity - num_reserved > 0,
 -- so concurrent callers can never over-reserve a product's stock.
 --
--- This statement is the project's core correctness claim. Deliberately left
--- untouched by the payment/expiry work so the contention strategy stays
--- swappable (Redis counters, advisory locks, SERIALIZABLE) after profiling.
+-- This statement is the project's core correctness claim, and the promise that
+-- the contention strategy stays swappable has now been collected: see
+-- orders.ReserveStrategy, which runs this statement in two of its three arms
+-- and folds it into a single CTE in the third. Profiling happened; the answer
+-- was to remove client round trips from inside the lock window rather than to
+-- change the locking primitive.
 UPDATE stock
 SET num_reserved = num_reserved + 1
 WHERE product_id = $1 AND quantity - num_reserved > 0
@@ -235,3 +238,91 @@ WHERE id = $1;
 UPDATE stripe_events
 SET attempts = attempts + 1, last_error = $2
 WHERE id = $1;
+
+-- name: ReserveAndCreateOrder :one
+-- The R2 arm: reserve + order insert as ONE statement, run with no explicit
+-- transaction and therefore implicitly atomic. Postgres holds the stock row's
+-- lock for server execution time only, with no client network at all inside the
+-- critical section — which is the entire point, and what makes this a
+-- structural fix rather than a tuning one. See ReserveStock above, whose
+-- comment has always promised this strategy stays swappable.
+--
+-- Ordering between the CTE arms is guaranteed by data dependency, not by
+-- writing order: `priced` reads `reserved`, and the INSERT reads `priced`, so
+-- the UPDATE is fully materialised before either runs. A data-modifying CTE is
+-- always materialised, so this is not an optimiser-fence question.
+--
+-- Concurrency is unchanged from the two-statement version. Under READ
+-- COMMITTED, an UPDATE that meets a row another transaction has locked waits
+-- for that transaction and then re-evaluates its WHERE against the *new* row
+-- version, so `quantity - num_reserved > 0` is re-checked after every winner
+-- commits. The stock table's CHECK (num_reserved <= quantity) is the backstop.
+--
+-- ZERO ROWS IS AMBIGUOUS: it means "no such product" and "no unit free" alike,
+-- and the API contract distinguishes those (404 vs 409 — cmd/contract_test.go
+-- asserts both). The caller disambiguates on the failure path; see
+-- cteStrategy.Reserve.
+--
+-- The explicit casts are not decoration: through INSERT ... SELECT out of a
+-- CTE, sqlc's parameter type inference is weaker than through VALUES and
+-- otherwise emits interface{} for the untyped arguments.
+WITH reserved AS (
+    UPDATE stock
+    SET num_reserved = num_reserved + 1
+    WHERE product_id = sqlc.arg(product_id)::bigint
+      AND quantity - num_reserved > 0
+    RETURNING product_id
+),
+priced AS (
+    -- Joining `reserved` is what snapshots the price only on success, and what
+    -- makes a failed reserve produce no order row rather than an orphaned one.
+    SELECT p.id, p.price_in_cents
+    FROM products p
+    JOIN reserved r ON r.product_id = p.id
+)
+INSERT INTO orders (customer_id, product_id, total_in_cents, expires_at)
+SELECT
+    sqlc.arg(customer_id)::bigint,
+    priced.id,
+    priced.price_in_cents,
+    sqlc.arg(expires_at)::timestamptz
+FROM priced
+RETURNING *;
+
+-- name: ClaimIdempotencyKey :one
+-- Claims a key, or reports that someone else already holds it.
+--
+-- The same guarded-write idiom the rest of this project rests on: the insert
+-- either wins or matches zero rows, and zero rows means a concurrent caller got
+-- there first. No lock, no read-then-write race.
+INSERT INTO order_idempotency (cognito_sub, idem_key, request_hash)
+VALUES ($1, $2, $3)
+ON CONFLICT (cognito_sub, idem_key) DO NOTHING
+RETURNING *;
+
+-- name: FindIdempotencyKey :one
+-- Read the winner's row after losing the claim above.
+SELECT * FROM order_idempotency
+WHERE cognito_sub = $1 AND idem_key = $2;
+
+-- name: CompleteIdempotencyKey :exec
+-- Records which order the key produced, so a later retry can return it.
+-- Guarded on order_id IS NULL so a replay can never overwrite the first answer.
+UPDATE order_idempotency
+SET order_id = $3
+WHERE cognito_sub = $1 AND idem_key = $2 AND order_id IS NULL;
+
+-- name: ReleaseIdempotencyKey :exec
+-- Frees a key whose reserve failed, so the caller can retry.
+-- Guarded on order_id IS NULL: a key that produced an order is never released.
+DELETE FROM order_idempotency
+WHERE cognito_sub = $1 AND idem_key = $2 AND order_id IS NULL;
+
+-- name: FindOrderByIDPlain :one
+-- The orders row on its own, with no customer or product join.
+--
+-- FindOrderByID exists for the ownership check and carries the joined customer
+-- for that reason. The idempotent replay path has already authenticated the
+-- caller by the key's own scope — a key is looked up under the caller's own
+-- Cognito subject — so it needs the order, not the join.
+SELECT * FROM orders WHERE id = $1;

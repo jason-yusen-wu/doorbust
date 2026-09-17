@@ -27,6 +27,23 @@ func GetInt(key string, fallback int) int {
 	return parsed
 }
 
+// GetBool reads a boolean knob. Like GetInt, an unparseable value falls back
+// rather than failing: these are hand-edited .env entries, and a typo should
+// leave the documented default in place instead of taking the zero value.
+// strconv.ParseBool accepts 1/t/T/TRUE/true/True and the false equivalents.
+func GetBool(key string, fallback bool) bool {
+	val := os.Getenv(key)
+	if val == "" {
+		return fallback
+	}
+
+	parsed, err := strconv.ParseBool(val)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
 func GetDuration(key string, fallback time.Duration) time.Duration {
 	val := os.Getenv(key)
 	if val == "" {

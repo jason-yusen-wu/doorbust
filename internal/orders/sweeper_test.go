@@ -28,7 +28,7 @@ func TestSweeperDrainsBacklogLargerThanOneBatch(t *testing.T) {
 
 	ctx := context.Background()
 	for i := range reservations {
-		if _, err := service.CreateOrder(ctx, productID, buyer(i)); err != nil {
+		if _, err := service.CreateOrder(ctx, CreateOrderParams{ProductID: productID, Claims: buyer(i)}); err != nil {
 			t.Fatalf("reserve %d: %v", i, err)
 		}
 	}
@@ -52,7 +52,7 @@ func TestSweeperRunStopsOnCancel(t *testing.T) {
 	service, _ := newTestService(pool, -time.Second)
 
 	ctx := context.Background()
-	if _, err := service.CreateOrder(ctx, productID, buyer(0)); err != nil {
+	if _, err := service.CreateOrder(ctx, CreateOrderParams{ProductID: productID, Claims: buyer(0)}); err != nil {
 		t.Fatalf("reserve: %v", err)
 	}
 

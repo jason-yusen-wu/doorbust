@@ -113,6 +113,12 @@ func writeOrderError(w http.ResponseWriter, err error) {
 		json.WriteError(w, http.StatusConflict, json.CodeOutOfStock, err.Error())
 	case errors.Is(err, ErrOrderNotPending):
 		json.WriteError(w, http.StatusConflict, json.CodeOrderNotPending, err.Error())
+	case errors.Is(err, ErrIdempotencyKeyReused):
+		json.WriteError(w, http.StatusConflict, json.CodeIdempotencyKeyReused, err.Error())
+	case errors.Is(err, ErrReserveInProgress):
+		// 409 rather than 425 or 503: the caller should retry, and the code
+		// field is what tells them which kind of conflict this is.
+		json.WriteError(w, http.StatusConflict, json.CodeReserveInProgress, err.Error())
 	default:
 		log.Println(err)
 		json.WriteInternalError(w)
@@ -206,7 +212,13 @@ func (h *handler) CreateOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	order, err := h.service.CreateOrder(r.Context(), req.ProductID, claims)
+	order, err := h.service.CreateOrder(r.Context(), CreateOrderParams{
+		ProductID: req.ProductID,
+		Claims:    claims,
+		// Optional. Absent means the caller has not opted in and gets the
+		// endpoint's original behaviour.
+		IdempotencyKey: r.Header.Get("Idempotency-Key"),
+	})
 	if err != nil {
 		writeOrderError(w, err)
 		return

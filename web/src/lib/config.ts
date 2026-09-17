@@ -23,8 +23,34 @@ export const COGNITO_REDIRECT_URI: string =
 
 export const STRIPE_PUBLISHABLE_KEY: string = import.meta.env.VITE_STRIPE_PUBLISHABLE_KEY ?? ''
 
-/** Whether the Hosted UI is configured enough to redirect to. */
-export const hostedUIConfigured = Boolean(COGNITO_DOMAIN && COGNITO_CLIENT_ID)
+/**
+ * Whether Cognito could possibly have this origin's callback registered.
+ *
+ * Cognito refuses to register a callback URL that is not HTTPS, with a single
+ * exemption for the loopback hosts (both `localhost` and `127.0.0.1` are
+ * accepted; anything else over plain HTTP is rejected at
+ * `create-user-pool-client` time). The deployed box is plain HTTP on a bare IP,
+ * so its callback *cannot* be registered — and sending someone there produces a
+ * bare Cognito error page reading `error=redirect_mismatch`.
+ *
+ * This is checked here rather than discovered by the user: a sign-in button
+ * that can only ever fail is worse than an honest message saying why.
+ */
+export function callbackOriginUsable(location: { protocol: string; hostname: string }): boolean {
+  return (
+    location.protocol === 'https:' ||
+    location.hostname === 'localhost' ||
+    location.hostname === '127.0.0.1'
+  )
+}
+
+/** Whether the Hosted UI is configured *and* reachable from where we are. */
+export const hostedUIConfigured =
+  Boolean(COGNITO_DOMAIN && COGNITO_CLIENT_ID) && callbackOriginUsable(window.location)
+
+/** Configured, but unusable from this origin — worth explaining specifically. */
+export const hostedUIBlockedByOrigin =
+  Boolean(COGNITO_DOMAIN && COGNITO_CLIENT_ID) && !callbackOriginUsable(window.location)
 
 /**
  * The paste-an-ID-token escape hatch, for running against a live API before the

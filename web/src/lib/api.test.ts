@@ -25,7 +25,7 @@ describe('error envelope', () => {
       jsonResponse(409, { error: { code: 'out_of_stock', message: 'product is out of stock' } }),
     )
 
-    const err = await createOrder(1041, 'tok').catch((e: unknown) => e)
+    const err = await createOrder(1041, 'tok', 'key-1').catch((e: unknown) => e)
     expect(err).toBeInstanceOf(ApiError)
     expect((err as ApiError).code).toBe('out_of_stock')
     expect((err as ApiError).status).toBe(409)
@@ -111,8 +111,20 @@ describe('requests', () => {
     // makes it a 400.
     fetchMock.mockResolvedValue(jsonResponse(201, {}))
 
-    await createOrder(1041, 'tok')
+    await createOrder(1041, 'tok', 'key-1')
     expect(fetchMock.mock.calls[0]?.[1]?.body).toBe(JSON.stringify({ product_id: 1041 }))
+  })
+
+  it('sends the idempotency key as a header, not in the body', async () => {
+    // Server-side the key is scoped to the caller's Cognito subject, so it
+    // belongs on the envelope rather than in the payload — and the body has to
+    // stay byte-identical across a retry or the request hash will not match.
+    fetchMock.mockResolvedValue(jsonResponse(201, {}))
+
+    await createOrder(1041, 'tok', 'key-abc')
+    const init = fetchMock.mock.calls[0]?.[1]
+    expect((init?.headers as Record<string, string>)['Idempotency-Key']).toBe('key-abc')
+    expect(init?.body).toBe(JSON.stringify({ product_id: 1041 }))
   })
 
   it('caps pagination the way the handlers expect', async () => {

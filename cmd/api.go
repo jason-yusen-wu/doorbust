@@ -21,6 +21,7 @@ import (
 	"github.com/jason-yusen-wu/doorbust/internal/orders"
 	"github.com/jason-yusen-wu/doorbust/internal/payments"
 	"github.com/jason-yusen-wu/doorbust/internal/products"
+	"github.com/jason-yusen-wu/doorbust/internal/ratelimit"
 	"github.com/jason-yusen-wu/doorbust/internal/web"
 	"github.com/stripe/stripe-go/v83"
 	"golang.org/x/sync/errgroup"
@@ -32,7 +33,9 @@ func (app *application) mount() http.Handler {
 	// middleware
 	r.Use(middleware.RequestID) // rate limiting & pass request in context
 	r.Use(middleware.RealIP)    // rate limiting, analytics & tracing
-	r.Use(middleware.Logger)
+	if app.config.logRequests {
+		r.Use(middleware.Logger)
+	}
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(60 * time.Second))
 
@@ -48,12 +51,20 @@ func (app *application) mount() http.Handler {
 		r.Use(cors.Handler(cors.Options{
 			AllowedOrigins: app.config.corsAllowedOrigins,
 			AllowedMethods: []string{http.MethodGet, http.MethodPost, http.MethodDelete, http.MethodOptions},
-			AllowedHeaders: []string{"Authorization", "Content-Type"},
+			AllowedHeaders: []string{"Authorization", "Content-Type", "Idempotency-Key"},
 			// We authenticate with a bearer token, not a cookie. Allowing
 			// credentials would also forbid a wildcard origin, and buys nothing.
 			AllowCredentials: false,
 			MaxAge:           300,
 		}))
+	}
+
+	// Rate limiting sits above everything, including the storefront and the
+	// public product reads: an unauthenticated scraper is exactly the traffic
+	// it exists to shed, and it must run before any database work happens.
+	ipLimiter := ratelimit.New(app.config.rateLimit.perIP, app.config.rateLimit.burst, app.config.rateLimit.idle)
+	if ipLimiter.Enabled() {
+		r.Use(ipLimiter.Middleware(ratelimit.ByIP))
 	}
 
 	queries := repo.New(app.db)
@@ -80,7 +91,24 @@ func (app *application) mount() http.Handler {
 		app.config.stripe.currency,
 		app.stripeClientOptions...,
 	)
-	orderService := orders.NewService(queries, app.db, gateway, app.config.orders.reservationTTL)
+	// The reserve arm is chosen at boot and never changes for the life of the
+	// process, so a bad RESERVE_STRATEGY fails at startup like a bad DSN does
+	// rather than silently benchmarking the default.
+	var resolver customers.Resolver = customers.DirectResolver{}
+	if app.config.orders.customerCache {
+		resolver = &customers.CachedResolver{}
+	}
+	reserve, err := orders.StrategyByName(
+		app.config.orders.reserveStrategy, queries, app.db, resolver,
+	)
+	if err != nil {
+		panic(err)
+	}
+	if app.config.orders.idempotency {
+		reserve = orders.WithIdempotency(reserve, queries)
+	}
+
+	orderService := orders.NewService(queries, app.db, gateway, reserve, app.config.orders.reservationTTL)
 	orderHandler := orders.NewHandler(orderService)
 
 	customerService := customers.NewService(queries)
@@ -94,6 +122,15 @@ func (app *application) mount() http.Handler {
 	// writes require a verified Cognito caller
 	r.Group(func(r chi.Router) {
 		r.Use(app.auth.Middleware)
+
+		// Per-identity limiting has to sit inside the auth group: the subject
+		// only exists on the context once the token has been verified.
+		subjectLimiter := ratelimit.New(
+			app.config.rateLimit.perSubject, app.config.rateLimit.burst, app.config.rateLimit.idle)
+		if subjectLimiter.Enabled() {
+			r.Use(subjectLimiter.Middleware(ratelimit.BySubject))
+		}
+
 		r.Get("/me", customerHandler.GetMe)
 
 		// Creating a sale is a vendor action, not something any signed-up
@@ -187,6 +224,13 @@ func (app *application) run(h http.Handler) error {
 
 	g, gctx := errgroup.WithContext(ctx)
 
+	// The profiler is not a background job: those return errors that bring the
+	// process down through the errgroup, and a diagnostic listener failing is
+	// not a reason to stop selling things.
+	if pprofSrv := newPprofServer(app.config.pprofAddr); pprofSrv != nil {
+		g.Go(func() error { return runPprof(gctx, pprofSrv) })
+	}
+
 	for _, job := range app.background {
 		g.Go(func() error {
 			if err := job.run(gctx); err != nil {
@@ -256,12 +300,38 @@ type config struct {
 	orders          ordersConfig
 	payments        paymentsConfig
 
+	// rateLimit bounds how fast one caller may reserve. Zero disables it,
+	// which is what a benchmark run wants — otherwise the limiter, not the
+	// reserve path, is what gets measured.
+	rateLimit rateLimitConfig
+
 	// corsAllowedOrigins is empty in production, where the frontend is served
 	// from this process and nothing is cross-origin. Empty disables CORS.
 	corsAllowedOrigins []string
 	// webDistDir holds the built frontend. Missing is fine — the API serves
 	// without it.
 	webDistDir string
+
+	// logRequests mounts chi's per-request logger. On in normal operation; off
+	// for measurement runs, where a formatted, mutex-serialised write to stdout
+	// on every request is a global lock and a syscall sitting on the exact path
+	// being measured.
+	logRequests bool
+
+	// pprofAddr serves Go's runtime profiler on a loopback-only listener.
+	// Empty disables it entirely — see newPprofServer.
+	pprofAddr string
+}
+
+type rateLimitConfig struct {
+	// perIP applies to everyone, including unauthenticated browsing.
+	perIP float64
+	// perSubject applies to a signed-in caller, so one account cannot spread
+	// its load across addresses. Usually tighter than perIP, since a household
+	// or an office may legitimately share an address.
+	perSubject float64
+	burst      int
+	idle       time.Duration
 }
 
 type cognitoConfig struct {
@@ -283,6 +353,22 @@ type ordersConfig struct {
 	reservationTTL time.Duration
 	sweepInterval  time.Duration
 	sweepBatchSize int32
+
+	// reserveStrategy selects which arm of the contention experiment this
+	// process runs. Every arm is oversell-free; see orders.ReserveStrategy.
+	// The default only moves when a measurement justifies it, and the number
+	// gets recorded in CLAUDE.md when it does.
+	reserveStrategy string
+	// customerCache memoises cognito sub -> customers.id, taking the caller
+	// lookup off the reserve path (R1). Off by default: the cache is currently
+	// unbounded, which is fine for a benchmark and not for production.
+	customerCache bool
+
+	// idempotency makes POST /orders safe to retry when the caller sends an
+	// Idempotency-Key. On by default — a retry reserving a second unit is a
+	// real bug, not a tuning choice — but switchable so its cost on the hot
+	// path can be measured as its own benchmark arm.
+	idempotency bool
 }
 
 type paymentsConfig struct {

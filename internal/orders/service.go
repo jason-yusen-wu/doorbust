@@ -58,7 +58,7 @@ type CheckoutResult struct {
 type Service interface {
 	GetOrder(ctx context.Context, id int64, claims auth.Claims) (repo.FindOrderByIDRow, error)
 	ListOrders(ctx context.Context, claims auth.Claims, limit, offset int32) ([]repo.ListOrdersByCustomerRow, error)
-	CreateOrder(ctx context.Context, productID int64, claims auth.Claims) (repo.Order, error)
+	CreateOrder(ctx context.Context, p CreateOrderParams) (repo.Order, error)
 	Checkout(ctx context.Context, orderID int64, claims auth.Claims) (CheckoutResult, error)
 	CancelOrder(ctx context.Context, orderID int64, claims auth.Claims) (repo.Order, error)
 
@@ -76,17 +76,23 @@ type svc struct {
 	db      repo.Beginner
 	gateway PaymentGateway
 
+	// reserve is the arm of the contention experiment this process is running.
+	// Every arm is oversell-free; they differ only in how long the stock row's
+	// lock is held. See ReserveStrategy.
+	reserve ReserveStrategy
+
 	// reservationTTL bounds how long an unpaid order may hold stock. It is
 	// our number, not Stripe's: if the processor never calls back, the unit
 	// still has to come back on sale.
 	reservationTTL time.Duration
 }
 
-func NewService(repo repo.Querier, db repo.Beginner, gateway PaymentGateway, reservationTTL time.Duration) Service {
+func NewService(repo repo.Querier, db repo.Beginner, gateway PaymentGateway, reserve ReserveStrategy, reservationTTL time.Duration) Service {
 	return &svc{
 		repo:           repo,
 		db:             db,
 		gateway:        gateway,
+		reserve:        reserve,
 		reservationTTL: reservationTTL,
 	}
 }
@@ -137,55 +143,31 @@ func (s *svc) linkCustomer(ctx context.Context, q repo.Querier, claims auth.Clai
 	return customers.Link(ctx, q, claims)
 }
 
-// CreateOrder is the reserve half of the buy flow: it finds/creates the
-// customer, snapshots the price, reserves one unit of stock, and creates a
-// 'pending' order, all in one transaction.
+// CreateOrder is the reserve half of the buy flow: it resolves the customer,
+// snapshots the price, reserves one unit of stock and creates a 'pending'
+// order.
 //
-// Statement order matters. ReserveStock takes a row lock on the contended
-// stock row, and everything after it in the transaction extends how long that
-// lock is held — so the customer upsert and the price read deliberately run
-// first, and only the order insert follows the reservation.
-func (s *svc) CreateOrder(ctx context.Context, productID int64, claims auth.Claims) (repo.Order, error) {
-	tx, err := s.db.Begin(ctx)
-	if err != nil {
-		return repo.Order{}, err
-	}
-	defer tx.Rollback(ctx)
+// How it does that is the strategy's business — the arms differ in statement
+// order and in whether there is an explicit transaction at all. What does not
+// differ, and is fixed here, is the expiry stamp: every arm reads the clock
+// once, in the same place, so a benchmark comparing them is not also comparing
+// two different TTLs.
+// CreateOrderParams is what the handler collects from one request. A struct
+// rather than a longer argument list because the idempotency key is optional
+// and positional booleans and strings at a call site age badly.
+type CreateOrderParams struct {
+	ProductID      int64
+	Claims         auth.Claims
+	IdempotencyKey string
+}
 
-	q := repo.New(tx)
-
-	customer, err := s.linkCustomer(ctx, q, claims)
-	if err != nil {
-		return repo.Order{}, err
-	}
-
-	product, err := q.FindProductByID(ctx, productID)
-	if err != nil {
-		return repo.Order{}, err
-	}
-
-	if _, err := q.ReserveStock(ctx, productID); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return repo.Order{}, ErrOutOfStock
-		}
-		return repo.Order{}, err
-	}
-
-	order, err := q.CreateOrder(ctx, repo.CreateOrderParams{
-		CustomerID:   customer.ID,
-		ProductID:    productID,
-		TotalInCents: product.PriceInCents,
-		ExpiresAt:    pgtype.Timestamptz{Time: time.Now().Add(s.reservationTTL), Valid: true},
+func (s *svc) CreateOrder(ctx context.Context, p CreateOrderParams) (repo.Order, error) {
+	return s.reserve.Reserve(ctx, ReserveParams{
+		ProductID:      p.ProductID,
+		Claims:         p.Claims,
+		IdempotencyKey: p.IdempotencyKey,
+		ExpiresAt:      pgtype.Timestamptz{Time: time.Now().Add(s.reservationTTL), Valid: true},
 	})
-	if err != nil {
-		return repo.Order{}, err
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return repo.Order{}, err
-	}
-
-	return order, nil
 }
 
 // Checkout is the synchronous half of payment. It does NOT complete the order

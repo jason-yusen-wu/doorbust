@@ -9,13 +9,17 @@ import (
 	"github.com/jason-yusen-wu/doorbust/internal/adapters/postgresql"
 	"github.com/jason-yusen-wu/doorbust/internal/auth"
 	"github.com/jason-yusen-wu/doorbust/internal/env"
+	"github.com/jason-yusen-wu/doorbust/internal/orders"
 )
 
 func main() {
 	// create Top-level Context
 	ctx := context.Background()
 	cfg := config{
-		addr:            ":8080",
+		// Configurable so a second instance can run alongside the deployed
+		// one — the benchmark's honesty run starts the app on another port
+		// rather than disturbing the live service.
+		addr:            env.GetString("ADDR", ":8080"),
 		shutdownTimeout: env.GetDuration("SHUTDOWN_TIMEOUT", 15*time.Second),
 		db: postgresql.Config{
 			DSN:             env.MustGetString("GOOSE_DBSTRING"),
@@ -44,6 +48,14 @@ func main() {
 			reservationTTL: env.GetDuration("RESERVATION_TTL", 15*time.Minute),
 			sweepInterval:  env.GetDuration("RESERVATION_SWEEP_INTERVAL", time.Minute),
 			sweepBatchSize: int32(env.GetInt("RESERVATION_SWEEP_BATCH", 100)),
+
+			// Which reserve arm to run. Defaults to the statement order this
+			// project shipped with, so behaviour is unchanged unless asked.
+			reserveStrategy: env.GetString("RESERVE_STRATEGY", orders.StrategyBaseline),
+			customerCache:   env.GetBool("CUSTOMER_CACHE", false),
+			// On by default: a retried POST /orders reserving a second unit is
+			// a bug, and a client that sends no key is unaffected either way.
+			idempotency: env.GetBool("ORDER_IDEMPOTENCY", true),
 		},
 		payments: paymentsConfig{
 			pollInterval: env.GetDuration("STRIPE_POLL_INTERVAL", 5*time.Second),
@@ -59,6 +71,16 @@ func main() {
 			eventInitialLookback: env.GetDuration("STRIPE_EVENT_INITIAL_LOOKBACK", time.Hour),
 		},
 
+		// Off by default so no existing deployment silently starts rejecting
+		// traffic on upgrade, and so a benchmark measures the reserve path
+		// rather than the limiter. Set both to enable.
+		rateLimit: rateLimitConfig{
+			perIP:      float64(env.GetInt("RATE_LIMIT_PER_IP_RPS", 0)),
+			perSubject: float64(env.GetInt("RATE_LIMIT_PER_SUBJECT_RPS", 0)),
+			burst:      env.GetInt("RATE_LIMIT_BURST", 20),
+			idle:       env.GetDuration("RATE_LIMIT_IDLE", 10*time.Minute),
+		},
+
 		// Unset in production: the frontend is served by this process, so
 		// nothing is cross-origin. Set it to the Vite dev server's origin
 		// (http://localhost:5173) when running the two separately.
@@ -66,6 +88,14 @@ func main() {
 		// Where `npm run build` leaves the bundle. The container image sets
 		// this to /srv/web; a missing directory just means no frontend.
 		webDistDir: env.GetString("WEB_DIST_DIR", "./web/dist"),
+
+		// On unless a benchmark turns it off. See config.logRequests.
+		logRequests: env.GetBool("LOG_REQUESTS", true),
+
+		// Off by default. Set PPROF_ADDR=127.0.0.1:6060 when investigating;
+		// the listener is forced onto loopback whatever is configured, so it
+		// cannot be exposed by a typo.
+		pprofAddr: env.GetString("PPROF_ADDR", ""),
 	}
 
 	// structured (text based) logger as global logger

@@ -38,6 +38,37 @@ func (q *Queries) CancelPendingOrder(ctx context.Context, id int64) (Order, erro
 	return i, err
 }
 
+const claimIdempotencyKey = `-- name: ClaimIdempotencyKey :one
+INSERT INTO order_idempotency (cognito_sub, idem_key, request_hash)
+VALUES ($1, $2, $3)
+ON CONFLICT (cognito_sub, idem_key) DO NOTHING
+RETURNING cognito_sub, idem_key, request_hash, order_id, created_at
+`
+
+type ClaimIdempotencyKeyParams struct {
+	CognitoSub  string `json:"cognito_sub"`
+	IdemKey     string `json:"idem_key"`
+	RequestHash string `json:"request_hash"`
+}
+
+// Claims a key, or reports that someone else already holds it.
+//
+// The same guarded-write idiom the rest of this project rests on: the insert
+// either wins or matches zero rows, and zero rows means a concurrent caller got
+// there first. No lock, no read-then-write race.
+func (q *Queries) ClaimIdempotencyKey(ctx context.Context, arg ClaimIdempotencyKeyParams) (OrderIdempotency, error) {
+	row := q.db.QueryRow(ctx, claimIdempotencyKey, arg.CognitoSub, arg.IdemKey, arg.RequestHash)
+	var i OrderIdempotency
+	err := row.Scan(
+		&i.CognitoSub,
+		&i.IdemKey,
+		&i.RequestHash,
+		&i.OrderID,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const claimNextStripeEvent = `-- name: ClaimNextStripeEvent :one
 SELECT id, type, payload, received_at, processed_at, attempts, last_error, stripe_created_at FROM stripe_events
 WHERE processed_at IS NULL AND attempts < $1
@@ -88,6 +119,25 @@ func (q *Queries) CommitStock(ctx context.Context, productID int64) (Stock, erro
 		&i.NumReserved,
 	)
 	return i, err
+}
+
+const completeIdempotencyKey = `-- name: CompleteIdempotencyKey :exec
+UPDATE order_idempotency
+SET order_id = $3
+WHERE cognito_sub = $1 AND idem_key = $2 AND order_id IS NULL
+`
+
+type CompleteIdempotencyKeyParams struct {
+	CognitoSub string      `json:"cognito_sub"`
+	IdemKey    string      `json:"idem_key"`
+	OrderID    pgtype.Int8 `json:"order_id"`
+}
+
+// Records which order the key produced, so a later retry can return it.
+// Guarded on order_id IS NULL so a replay can never overwrite the first answer.
+func (q *Queries) CompleteIdempotencyKey(ctx context.Context, arg CompleteIdempotencyKeyParams) error {
+	_, err := q.db.Exec(ctx, completeIdempotencyKey, arg.CognitoSub, arg.IdemKey, arg.OrderID)
+	return err
 }
 
 const completeOrder = `-- name: CompleteOrder :one
@@ -302,6 +352,30 @@ func (q *Queries) FindCustomerBySub(ctx context.Context, cognitoSub pgtype.Text)
 	return i, err
 }
 
+const findIdempotencyKey = `-- name: FindIdempotencyKey :one
+SELECT cognito_sub, idem_key, request_hash, order_id, created_at FROM order_idempotency
+WHERE cognito_sub = $1 AND idem_key = $2
+`
+
+type FindIdempotencyKeyParams struct {
+	CognitoSub string `json:"cognito_sub"`
+	IdemKey    string `json:"idem_key"`
+}
+
+// Read the winner's row after losing the claim above.
+func (q *Queries) FindIdempotencyKey(ctx context.Context, arg FindIdempotencyKeyParams) (OrderIdempotency, error) {
+	row := q.db.QueryRow(ctx, findIdempotencyKey, arg.CognitoSub, arg.IdemKey)
+	var i OrderIdempotency
+	err := row.Scan(
+		&i.CognitoSub,
+		&i.IdemKey,
+		&i.RequestHash,
+		&i.OrderID,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const findOrderByID = `-- name: FindOrderByID :one
 SELECT o.id, o.customer_id, o.product_id, o.status, o.created_at, o.total_in_cents, o.expires_at, o.stripe_payment_intent_id, c.email AS customer_email, c.cognito_sub AS customer_cognito_sub
 FROM orders o
@@ -339,6 +413,32 @@ func (q *Queries) FindOrderByID(ctx context.Context, id int64) (FindOrderByIDRow
 		&i.StripePaymentIntentID,
 		&i.CustomerEmail,
 		&i.CustomerCognitoSub,
+	)
+	return i, err
+}
+
+const findOrderByIDPlain = `-- name: FindOrderByIDPlain :one
+SELECT id, customer_id, product_id, status, created_at, total_in_cents, expires_at, stripe_payment_intent_id FROM orders WHERE id = $1
+`
+
+// The orders row on its own, with no customer or product join.
+//
+// FindOrderByID exists for the ownership check and carries the joined customer
+// for that reason. The idempotent replay path has already authenticated the
+// caller by the key's own scope — a key is looked up under the caller's own
+// Cognito subject — so it needs the order, not the join.
+func (q *Queries) FindOrderByIDPlain(ctx context.Context, id int64) (Order, error) {
+	row := q.db.QueryRow(ctx, findOrderByIDPlain, id)
+	var i Order
+	err := row.Scan(
+		&i.ID,
+		&i.CustomerID,
+		&i.ProductID,
+		&i.Status,
+		&i.CreatedAt,
+		&i.TotalInCents,
+		&i.ExpiresAt,
+		&i.StripePaymentIntentID,
 	)
 	return i, err
 }
@@ -687,6 +787,23 @@ func (q *Queries) MarkStripeEventProcessed(ctx context.Context, arg MarkStripeEv
 	return err
 }
 
+const releaseIdempotencyKey = `-- name: ReleaseIdempotencyKey :exec
+DELETE FROM order_idempotency
+WHERE cognito_sub = $1 AND idem_key = $2 AND order_id IS NULL
+`
+
+type ReleaseIdempotencyKeyParams struct {
+	CognitoSub string `json:"cognito_sub"`
+	IdemKey    string `json:"idem_key"`
+}
+
+// Frees a key whose reserve failed, so the caller can retry.
+// Guarded on order_id IS NULL: a key that produced an order is never released.
+func (q *Queries) ReleaseIdempotencyKey(ctx context.Context, arg ReleaseIdempotencyKeyParams) error {
+	_, err := q.db.Exec(ctx, releaseIdempotencyKey, arg.CognitoSub, arg.IdemKey)
+	return err
+}
+
 const releaseStock = `-- name: ReleaseStock :one
 UPDATE stock
 SET num_reserved = num_reserved - 1
@@ -714,6 +831,79 @@ func (q *Queries) ReleaseStock(ctx context.Context, productID int64) (Stock, err
 	return i, err
 }
 
+const reserveAndCreateOrder = `-- name: ReserveAndCreateOrder :one
+WITH reserved AS (
+    UPDATE stock
+    SET num_reserved = num_reserved + 1
+    WHERE product_id = $3::bigint
+      AND quantity - num_reserved > 0
+    RETURNING product_id
+),
+priced AS (
+    -- Joining ` + "`" + `reserved` + "`" + ` is what snapshots the price only on success, and what
+    -- makes a failed reserve produce no order row rather than an orphaned one.
+    SELECT p.id, p.price_in_cents
+    FROM products p
+    JOIN reserved r ON r.product_id = p.id
+)
+INSERT INTO orders (customer_id, product_id, total_in_cents, expires_at)
+SELECT
+    $1::bigint,
+    priced.id,
+    priced.price_in_cents,
+    $2::timestamptz
+FROM priced
+RETURNING id, customer_id, product_id, status, created_at, total_in_cents, expires_at, stripe_payment_intent_id
+`
+
+type ReserveAndCreateOrderParams struct {
+	CustomerID int64              `json:"customer_id"`
+	ExpiresAt  pgtype.Timestamptz `json:"expires_at"`
+	ProductID  int64              `json:"product_id"`
+}
+
+// The R2 arm: reserve + order insert as ONE statement, run with no explicit
+// transaction and therefore implicitly atomic. Postgres holds the stock row's
+// lock for server execution time only, with no client network at all inside the
+// critical section — which is the entire point, and what makes this a
+// structural fix rather than a tuning one. See ReserveStock above, whose
+// comment has always promised this strategy stays swappable.
+//
+// Ordering between the CTE arms is guaranteed by data dependency, not by
+// writing order: `priced` reads `reserved`, and the INSERT reads `priced`, so
+// the UPDATE is fully materialised before either runs. A data-modifying CTE is
+// always materialised, so this is not an optimiser-fence question.
+//
+// Concurrency is unchanged from the two-statement version. Under READ
+// COMMITTED, an UPDATE that meets a row another transaction has locked waits
+// for that transaction and then re-evaluates its WHERE against the *new* row
+// version, so `quantity - num_reserved > 0` is re-checked after every winner
+// commits. The stock table's CHECK (num_reserved <= quantity) is the backstop.
+//
+// ZERO ROWS IS AMBIGUOUS: it means "no such product" and "no unit free" alike,
+// and the API contract distinguishes those (404 vs 409 — cmd/contract_test.go
+// asserts both). The caller disambiguates on the failure path; see
+// cteStrategy.Reserve.
+//
+// The explicit casts are not decoration: through INSERT ... SELECT out of a
+// CTE, sqlc's parameter type inference is weaker than through VALUES and
+// otherwise emits interface{} for the untyped arguments.
+func (q *Queries) ReserveAndCreateOrder(ctx context.Context, arg ReserveAndCreateOrderParams) (Order, error) {
+	row := q.db.QueryRow(ctx, reserveAndCreateOrder, arg.CustomerID, arg.ExpiresAt, arg.ProductID)
+	var i Order
+	err := row.Scan(
+		&i.ID,
+		&i.CustomerID,
+		&i.ProductID,
+		&i.Status,
+		&i.CreatedAt,
+		&i.TotalInCents,
+		&i.ExpiresAt,
+		&i.StripePaymentIntentID,
+	)
+	return i, err
+}
+
 const reserveStock = `-- name: ReserveStock :one
 UPDATE stock
 SET num_reserved = num_reserved + 1
@@ -724,9 +914,12 @@ RETURNING id, product_id, quantity, num_reserved
 // Atomic check-and-increment: only succeeds while quantity - num_reserved > 0,
 // so concurrent callers can never over-reserve a product's stock.
 //
-// This statement is the project's core correctness claim. Deliberately left
-// untouched by the payment/expiry work so the contention strategy stays
-// swappable (Redis counters, advisory locks, SERIALIZABLE) after profiling.
+// This statement is the project's core correctness claim, and the promise that
+// the contention strategy stays swappable has now been collected: see
+// orders.ReserveStrategy, which runs this statement in two of its three arms
+// and folds it into a single CTE in the third. Profiling happened; the answer
+// was to remove client round trips from inside the lock window rather than to
+// change the locking primitive.
 func (q *Queries) ReserveStock(ctx context.Context, productID int64) (Stock, error) {
 	row := q.db.QueryRow(ctx, reserveStock, productID)
 	var i Stock

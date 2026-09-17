@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { beginSignIn } from '../auth/pkce'
 import { useAuth } from '../auth/AuthContext'
-import { devTokenLoginEnabled, hostedUIConfigured } from '../lib/config'
+import { devTokenLoginEnabled, hostedUIBlockedByOrigin, hostedUIConfigured } from '../lib/config'
 import { Button, Panel } from '../components/ui'
 import { Header } from '../components/Header'
 
@@ -39,6 +39,15 @@ export function SignIn() {
             <Button variant="fill" className="mt-8 w-full" onClick={goToHostedUI}>
               Continue
             </Button>
+          ) : hostedUIBlockedByOrigin ? (
+            // Rendering "Continue" here would send the buyer to a bare Cognito
+            // error page (error=redirect_mismatch), because Cognito will not
+            // register a non-HTTPS callback outside the loopback hosts.
+            <p className="mt-8 border border-ink px-4 py-3 font-mono text-[11.5px] leading-relaxed">
+              Sign-in isn't available on this address. It needs HTTPS — Cognito only permits a
+              plain-HTTP callback on localhost, so this deployment can browse sales but not sign
+              in. Run the app locally, or put it behind a domain with a certificate.
+            </p>
           ) : (
             <p className="mt-8 border border-edge px-4 py-3 font-mono text-[11.5px] leading-relaxed text-muted">
               The Cognito Hosted UI is not configured for this build. Set VITE_COGNITO_DOMAIN and
