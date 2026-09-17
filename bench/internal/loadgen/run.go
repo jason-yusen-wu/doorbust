@@ -50,7 +50,11 @@ type Results struct {
 	// ReservedTotal includes warm-up, and is what the orders table is compared
 	// against — the database kept those orders too.
 	ReservedTotal int64
-	Measured      time.Duration
+	// UnknownTotal counts requests whose outcome the client never learned:
+	// timeouts and connection errors. The server may or may not have created
+	// an order for each, which is what makes the cross-check an inequality.
+	UnknownTotal int64
+	Measured     time.Duration
 }
 
 // Run executes the schedule and returns what happened.
@@ -136,6 +140,7 @@ func Run(ctx context.Context, cfg Config) (Results, error) {
 		},
 		Reserved:      reserved,
 		ReservedTotal: rec.totalReserved(),
+		UnknownTotal:  rec.totalUnknown(),
 		Measured:      measured,
 	}, nil
 }

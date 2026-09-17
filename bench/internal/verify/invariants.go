@@ -16,7 +16,7 @@ import (
 
 // Check runs every invariant and returns them individually, so a failure says
 // which property broke rather than just that something did.
-func Check(ctx context.Context, pool *pgxpool.Pool, productIDs []int64, initialQty int32, clientReserved int64) report.Invariants {
+func Check(ctx context.Context, pool *pgxpool.Pool, productIDs []int64, initialQty int32, clientReserved, clientUnknown int64) report.Invariants {
 	var checks []report.InvariantCheck
 
 	add := func(name string, ok bool, format string, args ...any) {
@@ -34,12 +34,25 @@ func Check(ctx context.Context, pool *pgxpool.Pool, productIDs []int64, initialQ
 	// catches a 201 whose order is not there, and an order created for a
 	// request that reported an error. Nothing inside the server can see that
 	// class of bug, because the server is the thing under suspicion.
+	//
+	// Timeouts and connection errors make it an INEQUALITY rather than an
+	// equality, and that is not a weakening — it is the honest statement. A
+	// request that timed out client-side may well have been completed by the
+	// server; the client simply stopped listening. Asserting equality there
+	// reports a failure whose real cause is the benchmark's own timeout
+	// setting, which is how a correctness check trains its reader to ignore it.
 	var orders int64
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM orders`).Scan(&orders); err != nil {
+	switch err := pool.QueryRow(ctx, `SELECT count(*) FROM orders`).Scan(&orders); {
+	case err != nil:
 		add("client_server_order_count", false, "counting orders: %v", err)
-	} else {
+	case clientUnknown == 0:
 		add("client_server_order_count", orders == clientReserved,
 			"client saw %d successful reserves but the orders table holds %d", clientReserved, orders)
+	default:
+		add("client_server_order_count",
+			orders >= clientReserved && orders <= clientReserved+clientUnknown,
+			"orders table holds %d, outside the range [%d, %d] implied by %d observed reserves and %d requests whose outcome the client never learned",
+			orders, clientReserved, clientReserved+clientUnknown, clientReserved, clientUnknown)
 	}
 
 	for _, id := range productIDs {

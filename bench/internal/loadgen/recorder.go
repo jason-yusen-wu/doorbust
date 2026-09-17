@@ -96,6 +96,19 @@ func (r *recorder) totalReserved() int64 {
 	return n
 }
 
+// totalUnknown counts requests across the whole run whose outcome the client
+// never learned. The server may have completed them anyway.
+func (r *recorder) totalUnknown() int64 {
+	var n int64
+	for i := range r.outcome {
+		switch r.outcome[i] {
+		case OutcomeTimeout, OutcomeConnectError:
+			n++
+		}
+	}
+	return n
+}
+
 // collect turns raw samples into the reported latency and outcome figures.
 func (r *recorder) collect(from int) (report.Latencies, map[string]int64) {
 	counts := map[string]int64{}

@@ -254,7 +254,7 @@ func Execute(ctx context.Context, opts Options) (*report.Result, error) {
 	res.Outcomes = out.Outcomes
 	res.Through = out.Throughput
 	res.Through.OfferedPerSec = opts.Rate
-	res.Invariants = verify.Check(ctx, pool, productIDs, plan.Quantity, out.ReservedTotal)
+	res.Invariants = verify.Check(ctx, pool, productIDs, plan.Quantity, out.ReservedTotal, out.UnknownTotal)
 
 	applyValidity(res)
 	return res, nil
