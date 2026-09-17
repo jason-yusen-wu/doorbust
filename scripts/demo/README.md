@@ -68,115 +68,10 @@ Arranged so every state the storefront can render is on screen at once:
 | Cirrus Down Jacket | 100 | Upcoming — listed separately, not yet reservable |
 | Terra Cast Iron Set | 60 | Upcoming, further out |
 
-## Suggested running order
+## The script
 
-### 1. The problem (20s)
-
-Land on the storefront. Point at **Solstice Limited Print — 1 of 1**. One unit,
-two buyers about to click at the same time.
-
-### 2. The race (45s) — the centrepiece
-
-Two windows side by side, Alice and Bob, both on the Solstice page. Count down,
-both click **Reserve**.
-
-One gets an order. The other gets *"Gone. That run sold out."* Refresh: stock is
-**0**, not −1, and exactly one order exists.
-
-This is the whole thesis in one shot. Everything else is supporting material.
-
-### 3. Why it works (40s)
-
-Cut to `internal/adapters/postgresql/sqlc/queries.sql`, the `ReserveStock`
-query. The point to make out loud: **the check is inside the write**, so there
-is no gap between reading stock and acting on it. Zero rows affected is the
-answer — it means sold out.
-
-Worth adding: the same one-statement idea also makes Stripe's at-least-once
-webhook delivery safe, with no distributed lock anywhere in the system.
-
-### 4. The purchase flow (60s)
-
-Reserve the **Aether Running Shoe**. Show:
-
-- the **countdown** — it is read from the order's own `expires_at`, not a
-  hardcoded 15:00
-- **checkout** → Stripe test card `4242 4242 4242 4242`, any future expiry, any CVC
-- the order flipping to **completed** on its own a few seconds later
-
-That last beat is the interesting one: nothing in the request completed the
-order. Stripe confirmed the payment, a background worker picked the event up,
-and *that* completed it. Payment is split in two halves on purpose — calling
-Stripe while holding the inventory lock would make one buyer's slow card
-everyone else's outage.
-
-### 5. Reservations expire (40s, optional)
-
-Restart the server with a short fuse:
-
-```bash
-RESERVATION_TTL=45s RESERVATION_SWEEP_INTERVAL=10s make server
-```
-
-Reserve something and do not pay. Watch the countdown run out, then refresh the
-catalogue — the unit is back on sale, about 25 seconds after you reserved it.
-This is our timeout on our clock, so stock returns even if the payment processor
-never answers.
-
-The server log shows the moment it happens, which is a good cutaway:
-
-```
-msg="released expired reservations" count=1
-```
-
-**Restarting with different settings:** `make server` runs `go run`, which
-leaves a compiled child process holding port 8080 if it is not stopped cleanly.
-If the new settings do not seem to apply, that is why — the old server is still
-answering. Stop it properly first:
-
-```bash
-pkill -f "exe/cmd"; pkill -f "go run ./cmd"
-lsof -nP -iTCP:8080 -sTCP:LISTEN     # should print nothing
-```
-
-### 6. The measurements (60s) — the differentiator
-
-Most projects claim they are fast. Show it:
-
-```bash
-make bench-db
-make bench-sweep
-```
-
-The number to put on screen is the contrast at a fixed 2,000 reservations/second:
-
-| version | median response |
-| --- | --- |
-| original — six round trips, lock held across two | **2.17 seconds** |
-| rewritten — one SQL statement, lock held across none | **376 µs** |
-
-Say what the lever was: not a cleverer lock, just holding the lock across fewer
-network round trips. And that it removed the reason to add Redis at all.
-
-Committed results are in [`bench/results/`](../../bench/results/) if you want to
-show that the numbers are checked in next to the code.
-
-### 7. It's really deployed (20s)
-
-<http://18.191.71.225:8080> — same catalogue, running on EC2, deployed by
-GitHub Actions with no SSH key and no long-lived AWS credentials.
-
-*(Reachable only from the IP in the security group — yours. If it does not load,
-your IP changed: update `allowed_cidr` in `infra/terraform.tfvars` and re-apply.)*
-
-### 8. What is not finished (20s)
-
-Worth including — it reads as judgement, not weakness:
-
-- You cannot sign in on the deployed site, because there is no TLS certificate,
-  and Cognito will not accept a plain-HTTP callback.
-- The same missing certificate is why Stripe events are polled rather than
-  pushed — which turns out to recover better from outages anyway.
+Shot-by-shot narration is in [SCRIPT.md](SCRIPT.md) — a four-minute run through
+the buyer's experience.
 
 ## Checks before you record
 
@@ -187,6 +82,9 @@ curl -s localhost:8080/products | head       # eight products
 
 - Stripe keys are **test mode** (`sk_test_` / `pk_test_`) — verify before
   showing any card entry on camera.
+- Don't hard-refresh on `/orders` or `/orders/{id}`: the API shadows those two
+  paths on a single origin and a reload returns JSON. Clicking through the app
+  is fine. See `CLAUDE.md`.
 - The dev token-paste login is compiled out of this build, so `/signin` shows
   the real Cognito button only.
 - Hide anything showing your `.env`, and do not film the terminal you ran
