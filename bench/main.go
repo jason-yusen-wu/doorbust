@@ -97,6 +97,8 @@ func bind(fs *flag.FlagSet) *flags {
 	fs.DurationVar(&o.Timeout, "timeout", 10*time.Second, "per-request timeout")
 
 	tier := fs.Int("tier", 1, "1 = loopback (relative only), 2 = on the deployed box (absolute)")
+	fs.StringVar(&o.GitSHA, "git-sha", "",
+		"commit this binary was built from; required when running away from a checkout")
 	fs.StringVar(&o.SessionID, "session", "", "groups comparable runs (default: a timestamp)")
 	fs.IntVar(&o.AppGOMAXPROCS, "app-procs", 4, "GOMAXPROCS for the app under test")
 	fs.IntVar(&f.benchGO, "bench-procs", 2, "GOMAXPROCS for the generator itself")

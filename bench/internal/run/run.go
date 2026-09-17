@@ -58,6 +58,9 @@ type Options struct {
 	MaxInFlight int
 	Timeout     time.Duration
 
+	// GitSHA identifies the commit this binary was built from, for runs that
+	// happen away from a checkout. Empty means "read it from the working tree".
+	GitSHA        string
 	Tier          report.Tier
 	SessionID     string
 	AppGOMAXPROCS int
@@ -72,6 +75,16 @@ type Options struct {
 func Execute(ctx context.Context, opts Options) (*report.Result, error) {
 	res := report.New(opts.Tier)
 	res.Meta = report.Collect(opts.SessionID, opts.AppGOMAXPROCS)
+
+	// A run on the deployed box executes a shipped binary, where there is no
+	// checkout to interrogate — but the SHA is still known, because whoever
+	// built the binary knew it. Supplying it is not a way around the
+	// attribution rule; it is how attribution works when the code and the
+	// repository are on different machines.
+	if opts.GitSHA != "" {
+		res.Meta.GitSHA = opts.GitSHA
+		res.Meta.GitDirty = false
+	}
 
 	// A result that cannot be attributed to a commit is worse than no result:
 	// six months later nobody can tell which code produced it.
