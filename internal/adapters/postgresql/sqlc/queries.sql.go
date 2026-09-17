@@ -914,9 +914,12 @@ RETURNING id, product_id, quantity, num_reserved
 // Atomic check-and-increment: only succeeds while quantity - num_reserved > 0,
 // so concurrent callers can never over-reserve a product's stock.
 //
-// This statement is the project's core correctness claim. Deliberately left
-// untouched by the payment/expiry work so the contention strategy stays
-// swappable (Redis counters, advisory locks, SERIALIZABLE) after profiling.
+// This statement is the project's core correctness claim, and the promise that
+// the contention strategy stays swappable has now been collected: see
+// orders.ReserveStrategy, which runs this statement in two of its three arms
+// and folds it into a single CTE in the third. Profiling happened; the answer
+// was to remove client round trips from inside the lock window rather than to
+// change the locking primitive.
 func (q *Queries) ReserveStock(ctx context.Context, productID int64) (Stock, error) {
 	row := q.db.QueryRow(ctx, reserveStock, productID)
 	var i Stock

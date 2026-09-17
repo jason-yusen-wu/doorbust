@@ -57,7 +57,7 @@ func TestReserveContractIsIdenticalAcrossStrategies(t *testing.T) {
 func TestStrategyByNameRejectsUnknown(t *testing.T) {
 	t.Parallel()
 
-	if _, err := StrategyByName("redis-gate", nil, nil, nil); err == nil {
+	if _, err := StrategyByName("not-a-strategy", nil, nil, nil); err == nil {
 		t.Fatal("expected an unknown strategy name to be rejected")
 	}
 }

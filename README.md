@@ -92,15 +92,18 @@ Three things worth saying plainly about that table:
    the guarantee — moved p50 at a fixed offered rate from 2.17 seconds to 376
    microseconds.
 
-### So: does this need Redis?
+### What that bought, and what it replaced
 
-**No, and that is a finding rather than an opinion.** The original plan listed a
-Redis admission gate as the remedy for contention. Collapsing reserve into one
-statement removed five network round trips and bought at least 3.29× for the
-price of a CTE — no new infrastructure, no second source of truth, no cache to
-invalidate. The box this deploys to would never see the load at which the
-question becomes interesting again. Redis is listed under *Future work*, gated
-on a number, not under *Tech stack*.
+The original plan for contention was to put an admission gate in front of the
+database — more moving parts, a second source of truth, something to keep in
+sync. **The measurement made that unnecessary.** Collapsing reserve into one
+statement removed five network round trips from the request and all of them
+from inside the lock, for at least 3.29× and the price of a CTE. No new
+infrastructure, nothing to invalidate, and the guarantee is still one guarded
+`UPDATE` in one database.
+
+That is the decision this project exists to have made on evidence: the cheapest
+remedy was measured first, and it was enough.
 
 ### Reproducing it
 
