@@ -1,339 +1,430 @@
-# Doorbust 🛒🏃‍♂️
+# Doorbust
 
-A Go eCommerce backend built around one question: **what does it actually take
-to sell 360 units to 36,000 people at once without selling 361?**
+A flash-sale storefront and API, written in Go. It exists to answer one question
+carefully: **when far more people want an item than there are items, how do you
+make sure you never sell the same unit twice?**
 
-Not to answer it with an architecture diagram — to answer it with a number, and
-to keep the number in the repository next to the code that produced it.
+Selling 360 units to 36,000 simultaneous buyers is easy to get almost right. The
+failure mode is quiet — two requests both check stock, both see one left, both
+succeed, and you find out when a customer emails about an order you can't ship.
+
+Doorbust solves that with one small idea, applied consistently, and then
+measures the result instead of asserting it.
+
+---
+
+## Contents
+
+- [The problem](#the-problem)
+- [The solution](#the-solution)
+- [How fast is it?](#how-fast-is-it)
+- [Running it locally](#running-it-locally)
+- [How the code is organised](#how-the-code-is-organised)
+- [How payment works](#how-payment-works)
+- [API reference](#api-reference)
+- [Testing](#testing)
+- [Benchmarking](#benchmarking)
+- [Deployment](#deployment)
+- [Known limitations](#known-limitations)
+
+---
+
+## The problem
+
+Imagine two buyers clicking "Reserve" at the same instant, on the last unit:
 
 ```
-36,000 requests · 360 units in stock · one SKU · zero warm-up
-
-  360     orders created
-  35,640  correct "out of stock" answers
-  0       5xx
-  0       oversold units
-  num_reserved = 360, exactly matching the order count
+Buyer A                          Buyer B
+───────                          ───────
+read stock  → 1 left
+                                 read stock  → 1 left
+write stock → 0
+                                 write stock → 0
+✓ order created                  ✓ order created     ← one unit, two orders
 ```
 
-That run is `bench/results/*-doorbuster-cte.json`. Every figure below comes from
-a committed result file you can re-run.
+Both did exactly what the code told them to. The gap between reading the stock
+level and acting on it is where the bug lives, and it widens under load — which
+is precisely when a flash sale happens.
 
-## The guarantee, and the one idiom that implements it
+The usual fixes are to lock the row, wrap everything in a serialisable
+transaction, or put a counter in Redis in front of the database. All three work.
+All three add something you have to operate, reason about, or keep in sync.
 
-Inventory is never read-then-written. Every state change is a **single guarded
-`UPDATE`** whose `WHERE` clause is the precondition, and "zero rows affected"
-means *someone else got there first*:
+## The solution
+
+**Never read stock and then write it. Make the check part of the write.**
 
 ```sql
-UPDATE stock SET num_reserved = num_reserved + 1
-WHERE product_id = $1 AND quantity - num_reserved > 0
+UPDATE stock
+   SET num_reserved = num_reserved + 1
+ WHERE product_id = $1
+   AND quantity - num_reserved > 0   -- the check, inside the write
 RETURNING *;
 ```
 
-One idiom does triple duty:
+A single SQL statement is atomic. There is no gap for a competitor to slip
+into: either the row matched and you reserved a unit, or it didn't and someone
+beat you to it. **Zero rows affected is the answer, not an error** — it means
+"sold out".
 
-- **It prevents oversell.** The check and the increment are the same statement,
-  so there is no window between them.
-- **It makes Stripe's at-least-once webhook delivery idempotent** with no
-  distributed lock — a redelivered payment matches zero rows the second time.
-- **It stops a double release** driving `num_reserved` negative.
+That one idea does three jobs across the codebase:
 
-A `CHECK (num_reserved >= 0 AND num_reserved <= quantity)` on `stock` is the
-backstop, so an oversell could never be silent: it would fail the write rather
-than corrupt the ledger.
+| Where | What it prevents |
+| --- | --- |
+| Reserving stock | Overselling under any amount of concurrency |
+| Handling Stripe webhooks | Double-crediting an order when Stripe delivers the same event twice (it will — delivery is at-least-once) |
+| Releasing a reservation | Driving the reserved count negative when a cancel and an expiry race |
 
-## What the measurement found
+Every order state change uses the same shape: a condition in the `WHERE` clause,
+and "no rows matched" meaning *someone else got there first*.
 
-`CreateOrder` was originally six client round trips in one transaction, with the
-contended `stock` row's lock held across the **last two**. The predicted
-per-SKU ceiling is therefore roughly `1 / (client round trips in the lock × RTT
-+ server execution + commit)`, so the interesting variable is how much client
-network sits *inside* the critical section.
+As a backstop, the database itself enforces `num_reserved >= 0 AND
+num_reserved <= quantity`. If a bug ever did try to oversell, the write would
+fail loudly rather than corrupt the inventory.
 
-Three implementations, identical guarantees, differing only in that:
+## How fast is it?
 
-| arm | statements holding the lock | client RTT in lock |
+The interesting part is not the raw number, it's **what determines it**.
+
+Reserving stock originally took six round trips to the database inside one
+transaction, and the row stayed locked for the last two of them. While locked,
+every other buyer for that item waits. So the ceiling is roughly:
+
+```
+                    1
+  ───────────────────────────────────────
+  (round trips while locked × network RTT) + database work
+```
+
+The lever is not the locking strategy — it's **how much network time you hold
+the lock across**. Three versions were built and measured, identical in
+behaviour, differing only in that:
+
+| version | order of operations | round trips while locked |
 | --- | --- | --- |
-| `baseline` | `ReserveStock` → `CreateOrder` → `COMMIT` | 2 |
-| `reserve-last` | `CreateOrder` → `ReserveStock` → `COMMIT` | 1 |
-| `cte` | one statement, no explicit transaction | **0** |
+| `baseline` | reserve → create order → commit | 2 |
+| `reserve-last` | create order → reserve → commit | 1 |
+| `cte` | one single SQL statement | **0** |
 
-**At 2,000 reserves/s offered against a single hot SKU:**
+### On a laptop, everything local
 
-| arm | goodput | p50 latency | p99 latency |
-| --- | --- | --- | --- |
-| `baseline` | 1,613/s — saturated | **2,173,260 µs** (2.17 s) | 2,944,044 µs |
-| `reserve-last` | 2,000/s | 1,249 µs | 2,057 µs |
-| `cte` | 2,000/s | **376 µs** | 563 µs |
+At a fixed 2,000 reservations/second offered:
 
-**Measured per-SKU ceiling:**
-
-| arm | ceiling | vs. baseline | predicted |
-| --- | --- | --- | --- |
-| `baseline` | 1,613/s | 1.00× | 4,290/s |
-| `reserve-last` | 2,487/s | 1.54× | 7,561/s |
-| `cte` | **≥ 5,302/s** | **≥ 3.29×** | 10,743/s |
-
-Three things worth saying plainly about that table:
-
-1. **The CTE figure is a lower bound, not a plateau.** At 6,000 rps the
-   *generator* degraded before the server did, so the real ceiling was never
-   found. A number the measurement cannot support is worth less than an honest
-   bound.
-2. **The model predicted the ordering, not the magnitude.** It over-predicts
-   every absolute ceiling by 2–2.6×, which is the more useful outcome: the lock
-   window is not the only serialisation point once the generator, the app and
-   Postgres share CPU and every request pays an RSA-2048 token verification.
-   Prediction and measurement sit side by side in every result file so the gap
-   stays visible.
-3. **The headline is the latency column, not the throughput one.** Removing
-   client round trips from inside the lock — and changing nothing else about
-   the guarantee — moved p50 at a fixed offered rate from 2.17 seconds to 376
-   microseconds.
-
-### And on the real deployment
-
-Tier 1 runs on a laptop with everything on loopback. The honesty run puts the
-app on the deployed `t3.micro` with the database on Neon in the same region —
-a real network between the app and its rows.
-
-**At 500 reserves/s offered against one hot SKU:**
-
-| arm | goodput | p50 latency | outcome |
-| --- | --- | --- | --- |
-| `baseline` | 0.4/s | — | **7,989 of 8,000 requests timed out** |
-| `reserve-last` | 457.7/s | 1,394,532 µs | served, heavily queued |
-| `cte` | **500.0/s** | **2,845 µs** | served at the full offered rate |
-
-Two things about that table are worth more than the numbers.
-
-**The effect is larger in production than in the lab.** The lock window is
-denominated in *round trips*, and a real network round trip (measured: 642 µs)
-costs about six times a loopback one — so removing round trips from inside the
-lock buys more here, not less. The laptop was flattering the baseline.
-
-**The 642 µs is itself a finding.** This repo had assumed ~5 ms for a serverless
-Postgres and predicted, on that basis, that every arm would be pinned near
-100/s and indistinguishable. The assumption was wrong by a factor of eight,
-which is the argument for measuring a model's inputs in the same run as the
-model rather than looking them up once.
-
-Honest limits on this one: a `t3.micro` has two vCPUs, and above roughly
-500 rps the generator's own scheduling degrades because the app is using them —
-so those runs publish p50 through p99 and withhold p99.9, and the CTE ceiling
-(~776/s) is a bound the generator could not cleanly exceed rather than a plateau
-the server reached.
-
-### What that bought, and what it replaced
-
-The original plan for contention was to put an admission gate in front of the
-database — more moving parts, a second source of truth, something to keep in
-sync. **The measurement made that unnecessary.** Collapsing reserve into one
-statement removed five network round trips from the request and all of them
-from inside the lock, for at least 3.29× and the price of a CTE. No new
-infrastructure, nothing to invalidate, and the guarantee is still one guarded
-`UPDATE` in one database.
-
-That is the decision this project exists to have made on evidence: the cheapest
-remedy was measured first, and it was enough.
-
-### Reproducing it
-
-```bash
-make bench-db        # throwaway Postgres on :55433, tuned so the arms separate
-make bench-sweep     # every arm, plus the self-saturation check
-```
-
-The generator (`bench/`) is **open-loop**: arrival times are computed before
-anything is sent, and latency is measured from a request's *scheduled* arrival
-rather than from when it was actually sent. A closed-loop generator cannot offer
-load faster than the server answers, so it slows down exactly when the server
-does and the queueing never appears — that is coordinated omission, and it is
-the difference between a load test and a `for` loop.
-
-Runs judge themselves. Generator saturation, connection errors, schedule lag
-over threshold, any 5xx, or failed inventory invariants each print `RUN VOID`
-and exit non-zero. `valid`, `tier` and `absolute_throughput_valid` are required
-fields of the result schema, so a number cannot be copied out without the
-caveat that says what may be claimed from it.
-
-**Tier 1 numbers compare arms against each other on one machine** — the
-generator shares CPU with the app and the database, so they are not absolute
-throughput, and the result files say so in their own text. Tier 2 numbers come
-from the deployed box against real Neon and are absolute, with their own
-caveats recorded the same way.
-
-A run also grades itself by *which percentiles it can support*. Each late send
-inflates one sample, so the share of late sends bounds which tail statistics the
-generator could have moved: above 1% p99 is contaminated and the run is void;
-above 0.1% only p99.9 is, and the summary prints `p99.9 (untrusted: N% late
-sends)` rather than a number the run cannot stand behind.
-
-## Architecture
-
-Ports and adapters, one package per feature, wired in `cmd/api.go`'s `mount()`.
-
-```
-cmd/                     composition root, router, readiness
-internal/orders/         reserve → pay → fulfil, and the three reserve arms
-internal/payments/       Stripe gateway, webhook, event worker, event poller
-internal/customers/      Cognito identity → customers row
-internal/products/       catalogue
-internal/auth/           Cognito ID token verification (resource server)
-internal/ratelimit/      per-IP and per-subject token buckets
-internal/web/            serves the compiled storefront
-internal/adapters/       pgxpool + sqlc-generated queries
-web/                     Vite + React + TypeScript storefront
-bench/                   open-loop load generator
-```
-
-### Payment is two halves, deliberately
-
-`POST /orders` reserves stock (`pending`). `POST /orders/{id}/checkout` creates a
-Stripe PaymentIntent and returns its `client_secret` (`awaiting_payment`) — it
-commits no stock. Payment completes **asynchronously**: `stripe_events` →
-in-process worker → `CompleteOrder` + `CommitStock`.
-
-The Stripe call sits *between* two short transactions rather than inside one.
-An outbound HTTP call holding a row lock on contended inventory would turn
-Stripe's latency into every other buyer's lock latency — the exact pathology
-this project exists to avoid.
-
-Three background goroutines run in-process: the **event worker** (drains
-`stripe_events` with `FOR UPDATE SKIP LOCKED`), the **reservation sweeper**
-(expires reservations and releases their stock), and the **event poller**. The
-sweeper is deliberately *not* coupled to the worker: expiry is our rule on our
-clock, so stock returns to sale even if the processor never calls back.
-
-**The paid-but-expired race is handled loudly, not silently.** If a payment
-succeeds for an order the sweeper already expired, `CompleteOrder` matches zero
-rows; the event is stamped processed with `last_error` and logged at ERROR for
-manual refund. Retrying cannot fix it, so it must not spin.
-
-## API
-
-| Method | Path | Auth |
+| version | kept up? | median response |
 | --- | --- | --- |
-| `GET` | `/health` · `/health/ready` | public |
-| `GET` | `/products` · `/products/{id}` | public |
-| `GET` | `/me` | Cognito |
-| `GET` | `/orders` · `/orders/{id}` | Cognito, owner only |
-| `POST` | `/orders` | Cognito |
-| `POST` | `/orders/{id}/checkout` | Cognito, owner only |
-| `DELETE` | `/orders/{id}` | Cognito, owner only |
-| `POST` | `/products` | Cognito, `vendors` group |
-| `POST` | `/webhooks/stripe` | Stripe signature |
-| `GET` | `/*` | public (storefront) |
+| `baseline` | no — 1,613/s | 2.17 **seconds** |
+| `reserve-last` | yes | 1,249 µs |
+| `cte` | yes | **376 µs** |
 
-Every non-2xx body is `{"error":{"code":"...","message":"..."}}`. The `code`
-values are the stable, machine-readable half of the contract.
+Maximum sustained rate: 1,613/s → 2,487/s → **at least 5,302/s**.
 
-`POST /orders` accepts an **`Idempotency-Key`** header. Without one a retry
-reserves a second unit; with one it returns the original order. Three outcomes
-stay distinct rather than collapsed: the order, `reserve_in_progress` (the first
-request is still running — retriable), and `idempotency_key_reused` (the key was
-first used with a different body, which is a client bug).
+### On the real deployment
 
-`TestEveryRouteIsClassified` walks the real router and fails if any route is
-missing from the access table in `cmd/api_test.go`. A new route with no entry
-fails by default — which is how an ungated `POST /products` was caught.
+A `t3.micro` running the app, with the database on [Neon](https://neon.tech) —
+a real network between the two. At 500 reservations/second offered:
 
-## Quick start
+| version | kept up? | median response |
+| --- | --- | --- |
+| `baseline` | **no — 7,989 of 8,000 requests timed out** | — |
+| `reserve-last` | 457.7/s | 1.39 seconds |
+| `cte` | **yes, 500/s** | **2,845 µs** |
 
-```bash
-cp .env.example .env     # Postgres DSN + Cognito issuer/client id + Stripe test keys
-make server              # goose up, then the API on :8080
+**The gap is wider in production than on a laptop, not narrower.** The lock is
+held for a number of *network round trips*, and a real one (measured: 642 µs)
+costs about six times a local one. Removing them is worth six times as much.
+
+Two honest notes:
+
+- The laptop numbers compare the three versions **against each other on one
+  machine**. They are not a capacity figure for your hardware.
+- We never found the ceiling of the fastest version on the deployed box. Above
+  ~500/s the load generator — sharing two CPUs with the app — became the
+  bottleneck first.
+
+### The correctness result
+
+The point of all this is that being fast must not mean being wrong:
+
+```
+36,000 requests · 360 units in stock · one item · no warm-up
+
+  360     orders created
+  35,640  "sold out" responses
+  0       server errors
+  0       oversold units
 ```
 
-Frontend (Node 22): `cd web && npm ci && npm run dev`, with
-`CORS_ALLOWED_ORIGINS=http://localhost:5173` on the server. Or `npm run build`
-once and let `make server` serve `web/dist` from `:8080` — which is what
-production does, at one origin, with no CORS at all.
+Every figure on this page comes from a JSON file in [`bench/results/`](bench/results/),
+committed alongside the code that produced it.
 
-### Tests
+### Did this need Redis?
+
+No — and that's a measured answer, not a preference. The original plan was to
+put a Redis counter in front of the database. Rewriting the reservation as a
+single SQL statement removed five network round trips and made everything at
+least three times faster, with no new infrastructure to run and no second copy
+of the inventory to keep in sync.
+
+## Running it locally
+
+**You'll need:** Go 1.26+, Node 22+, Docker, `goose`, and a PostgreSQL database.
 
 ```bash
-make test           # unit only, ~4s, no database
-make test-db        # throwaway Postgres on :55432
-make test-all       # everything, -race -shuffle=on
-make cover          # adds the per-package coverage floors
+git clone <this repo> && cd doorbust
+cp .env.example .env     # then fill in the values below
+make server              # applies migrations, starts the API on :8080
 ```
 
-**Every database test gets its own database**, cloned from a migrated template
-whose name embeds a hash of the migration files. That is what allows
-`t.Parallel()` and lets globally-scoped operations — the expiry sweep, the
-worker's queue claim — be asserted to an exact count rather than "at least one".
+`.env` needs five values. The app refuses to start without them, rather than
+failing later on the first request that needs one:
 
-**Auth is tested against the real verifier**, not stubbed past it: a local OIDC
-issuer serves discovery and a JWKS and mints RS256 tokens, so expired,
-wrong-audience, wrong-issuer and forged tokens are all genuinely rejected. The
-load generator mints its tokens from that same issuer, so a benchmark's tokens
-take exactly the path the tests cover.
+| Variable | What it is |
+| --- | --- |
+| `GOOSE_DBSTRING` | PostgreSQL connection string |
+| `COGNITO_ISSUER_URL` | Your AWS Cognito user pool's issuer URL |
+| `COGNITO_CLIENT_ID` | The app client ID |
+| `STRIPE_SECRET_KEY` | A Stripe **test mode** key |
+| `STRIPE_WEBHOOK_SECRET` | Only used for local webhook testing — any placeholder works otherwise |
 
-**Stripe is stubbed at the HTTP layer**, not behind an interface, so tests
-assert what is actually sent — amount, currency, `Idempotency-Key`,
-`metadata[order_id]`. A fake interface would happily accept a checkout that
-charged the wrong amount.
+Everything else has a sensible default; `.env.example` documents the rest.
 
-The oversell test, the cancel-race test and the 404-vs-409 contract test all run
-against **every** reserve arm. An arm that is faster and oversells is a bug, not
-a result.
+For the storefront:
+
+```bash
+cd web
+npm ci
+npm run build            # then make server serves it at localhost:8080
+```
+
+Or run it separately with live reload — `npm run dev` on `:5173`, plus
+`CORS_ALLOWED_ORIGINS=http://localhost:5173` in the API's `.env`.
+
+> **Note:** sign-in only works on `localhost`. Cognito refuses to register a
+> callback URL that isn't HTTPS, and the deployed box has no TLS certificate.
+> See [Known limitations](#known-limitations).
+
+## How the code is organised
+
+A request flows in one direction: **HTTP handler → service → database**. Each
+feature is a package containing all three, and they're wired together in one
+place ([`cmd/api.go`](cmd/api.go)), so there's a single file to read to see how
+the app is assembled.
+
+```
+cmd/                    Entry point, routing, startup and shutdown
+internal/
+  orders/               Reserving, paying for and cancelling orders
+  payments/             Stripe: the gateway, webhook, and event processor
+  products/             The catalogue
+  customers/            Mapping a Cognito login to a customer record
+  auth/                 Verifying Cognito tokens
+  ratelimit/            Per-IP and per-user request limits
+  web/                  Serving the built storefront
+  adapters/postgresql/  Connection pool and generated SQL
+web/                    Storefront (React + TypeScript + Tailwind)
+bench/                  Load generator
+```
+
+Handlers depend on an interface, not a concrete database type, so the business
+logic can be tested without a database when a database wouldn't add anything.
+
+Queries are written by hand in [`queries.sql`](internal/adapters/postgresql/sqlc/queries.sql)
+and turned into typed Go by [sqlc](https://sqlc.dev). **Don't edit the generated
+files** — change the SQL and run `sqlc generate`. CI fails if the two drift
+apart.
+
+## How payment works
+
+Taking payment is split into two halves, and the split is the interesting part.
+
+```
+1. POST /orders                 Reserve a unit.                  → pending
+2. POST /orders/{id}/checkout   Create a Stripe payment intent.  → awaiting_payment
+3. (Stripe processes payment)
+4. Event from Stripe            Confirm and finalise the sale.   → completed
+```
+
+**Why split it?** Step 2 calls Stripe over the internet, which can take
+hundreds of milliseconds. If that call happened while holding the inventory
+lock, *every other buyer of that item would wait for Stripe* — turning one
+person's slow payment into everyone's outage.
+
+So the lock is taken and released in step 1, and Stripe is called afterwards.
+Payment confirmation arrives later and is handled asynchronously.
+
+Three background tasks run inside the process:
+
+- **Event worker** — processes payment confirmations from a queue table.
+- **Reservation sweeper** — releases reservations that were never paid for.
+  Deliberately independent of Stripe: it's *our* timeout on *our* clock, so
+  stock goes back on sale even if the payment processor never responds.
+- **Event poller** — fetches events from Stripe's API (see
+  [Known limitations](#known-limitations) for why it pulls rather than
+  receiving webhooks).
+
+**One case is handled loudly rather than silently:** if a payment succeeds for
+an order the sweeper already expired, money moved but no stock is owed. Doorbust
+logs it at ERROR for a human to refund, rather than retrying forever or
+pretending it didn't happen.
+
+## API reference
+
+| Method | Path | Who can call it |
+| --- | --- | --- |
+| `GET` | `/health`, `/health/ready` | Anyone |
+| `GET` | `/products`, `/products/{id}` | Anyone |
+| `GET` | `/me` | Signed-in users |
+| `GET` | `/orders`, `/orders/{id}` | The order's owner |
+| `POST` | `/orders` | Signed-in users |
+| `POST` | `/orders/{id}/checkout` | The order's owner |
+| `DELETE` | `/orders/{id}` | The order's owner |
+| `POST` | `/products` | Users in the `vendors` group |
+| `POST` | `/webhooks/stripe` | Stripe (signature-verified) |
+
+Errors always come back in the same shape, and the `code` is stable enough to
+branch on:
+
+```json
+{ "error": { "code": "out_of_stock", "message": "product is out of stock" } }
+```
+
+**Retrying a reservation safely.** `POST /orders` accepts an `Idempotency-Key`
+header. Send the same key when retrying and you'll get the original order back
+instead of reserving a second unit. Without a key, a retry reserves again — so
+send one.
+
+`/health` versus `/health/ready`: the first says the process is alive; the
+second checks the database and the Stripe poller and returns 503 if either is
+broken. Deploys watch the second one.
+
+## Testing
+
+```bash
+make test        # fast — no database needed, a few seconds
+make test-db     # start a throwaway PostgreSQL in Docker
+make test-all    # everything, including database and HTTP tests
+make cover       # enforce per-package coverage minimums
+```
+
+230 tests. A few deliberate choices worth knowing about:
+
+- **Every database test gets its own database**, cloned from a migrated
+  template. That's what lets them run in parallel and assert exact counts.
+- **Tests that need no database skip themselves**, so `go test ./...` passes on
+  a fresh clone with nothing set up.
+- **Authentication is tested against the real verifier**, using a local server
+  that issues genuine signed tokens. Expired, forged, and wrong-audience tokens
+  are actually rejected, not stubbed.
+- **Stripe is faked at the HTTP layer**, so tests check the real request —
+  including the amount. Faking the interface instead would happily accept code
+  that charged the wrong price.
+- **Routes fail closed.** A test walks the router and fails if any route hasn't
+  declared who may call it. Forgetting is not an option; it's how an
+  accidentally-public endpoint was once caught.
+- **Concurrency tests run against all three reservation strategies.** A faster
+  version that oversells is a bug, not an improvement.
+
+## Benchmarking
+
+```bash
+make bench-db      # a PostgreSQL tuned so the comparison is meaningful
+make bench-sweep   # run every version and compare
+```
+
+The load generator is **open-loop**: it decides when each request should be sent
+before the run starts, and measures from that scheduled time.
+
+This matters more than it sounds. The obvious way to write a load tester — a
+pool of workers that each send a request, wait for the reply, and send another —
+*cannot send faster than the server replies*. When the server slows down, the
+test slows down with it, and the queue that would form in real life never does.
+You measure how long the server took, and never see how long users waited.
+(It's called coordinated omission.)
+
+**Runs judge themselves.** A run reports `RUN VOID` and exits non-zero if the
+generator couldn't keep to its schedule, if it ran out of sockets, if any
+request returned a server error, or if the inventory doesn't add up afterwards.
+It also refuses to record results from uncommitted code — a number you can't tie
+to a commit isn't worth keeping.
+
+It also grades its own precision. A late request inflates one measurement, so
+the proportion of late requests bounds which percentiles are trustworthy; rather
+than print a figure it can't stand behind, it says
+`p99.9 (untrusted: 1.2% late sends)`.
+
+**Every run checks the inventory afterwards** — orders never exceed stock,
+reservations match live orders, nothing went negative. That's what makes the
+benchmark a correctness test under load rather than a speed test.
+
+### Profiling
+
+Set `PPROF_ADDR=127.0.0.1:6060` to enable Go's profiler. It listens on
+localhost only — always, regardless of what you configure — because those
+endpoints will dump memory and stack traces to anyone who can reach them. On a
+deployed box, tunnel to it:
+
+```bash
+aws ssm start-session --target <instance-id> \
+  --document-name AWS-StartPortForwardingSession \
+  --parameters '{"portNumber":["6060"],"localPortNumber":["6060"]}'
+go tool pprof http://localhost:6060/debug/pprof/profile?seconds=30
+```
 
 ## Deployment
 
-Push to `main`. `.github/workflows/ci-cd.yml` runs `build` (vet, build, `sqlc`
-drift), `test` (`-race` against a Postgres service container, plus coverage
-floors) and `web` (lint, typecheck, vitest, build) in parallel, then `deploy`
-builds a SHA-tagged image, pushes it to ECR, runs `goose up` against Neon, and
-drives the rollout over **SSM Run Command** — no SSH key in CI, no inbound port
-opened, no long-lived AWS keys (the runner authenticates via GitHub OIDC).
+Push to `main`. GitHub Actions runs the Go build and tests, the frontend build
+and tests, and a check that the generated SQL matches its source — then builds a
+container image, tags it with the commit, pushes it to ECR, migrates the
+database, and restarts the service.
 
-Infrastructure is one EC2 instance in `infra/` (Terraform): no load balancer, no
-ECS. Terraform is always applied by hand, since state is local.
-`scripts/deploy.sh` ships an image over SSH as an escape hatch when CI is broken.
+Two details worth copying:
+
+- **No SSH keys or AWS credentials are stored in GitHub.** The runner
+  authenticates with OIDC, and deploys are driven through AWS Systems Manager,
+  which connects outward from the instance. No inbound port is opened.
+- **Database migrations run before the restart.** Keep them
+  backwards-compatible, since the old code briefly runs against the new schema.
+
+Infrastructure is one EC2 instance, defined in [`infra/`](infra/) with
+Terraform, applied by hand. There's no load balancer and no container
+orchestrator — for a single instance they'd add cost and moving parts without
+adding anything.
 
 ## Known limitations
 
-Recorded rather than hidden, because each one is a consequence of a deliberate
-trade and most of them share a single root cause.
+Written down rather than glossed over. Most of them share one root cause: the
+deployed box has no domain name and no TLS certificate.
 
-- **Nobody can sign in on the deployed box.** Cognito refuses to register a
-  non-HTTPS callback outside the loopback hosts, and the box has no domain, no
-  Elastic IP and no TLS — so `http://<ip>:8080/auth/callback` is rejected at
-  `create-user-pool-client` time. The deployed storefront browses the catalogue;
-  sign-in works on `localhost` only. `/signin` detects this and explains it
-  rather than rendering a button whose only outcome is a Cognito error page.
-- **Stripe events are pulled, not pushed**, for the same missing TLS: Stripe
-  cannot reach the box, so a poller lists `/v1/events` on a timer into the same
-  inbox the webhook writes to. This needs no infrastructure and no dashboard
-  configuration, and it catches up after an outage by construction.
-- **The benchmark cannot saturate the deployed box cleanly.** A `t3.micro` has
-  two vCPUs, and co-locating an open-loop generator with a hard-working app
-  starves one of them. Tier-2 figures above ~500 rps withhold p99.9 for that
-  reason, and the CTE ceiling there is a lower bound rather than a measured
-  plateau. A separate generator instance would fix it and is not worth the money
-  for this project.
-- **One environment.** Every post-deploy check runs against production. The
-  industry answer is a staging environment; for one box and one developer,
-  making failures self-correcting is the cheaper substitute — and is not built
-  yet either.
-- **Authorization is one Cognito group.** `POST /products` requires `vendors`;
-  everything else authenticated is open to any signed-in user. Group membership
-  rides in the ID token, so granting it takes effect on the next token, not
-  immediately.
-- **Rate limiting is off by default** (`RATE_LIMIT_PER_IP_RPS`,
-  `RATE_LIMIT_PER_SUBJECT_RPS`), so an upgrade never starts rejecting traffic
-  unasked.
+- **You can't sign in on the deployed site.** Cognito won't register a
+  non-HTTPS callback URL (except on `localhost`), so the public site can browse
+  the catalogue but not log in. Fixing it means buying a domain and terminating
+  TLS — a deliberate, separate decision.
+- **Stripe events are fetched, not received.** Stripe can't reach the box for
+  the same reason, so the app polls Stripe's API instead. This turns out to be
+  more robust anyway: it catches up automatically after a restart or an outage,
+  where a missed webhook is simply lost.
+- **The benchmark can't fully saturate the deployed box.** Two CPUs aren't
+  enough to run both the load generator and a busy server; the generator gives
+  out first. The fastest version's true ceiling there is unknown.
+- **Authorisation is coarse.** One Cognito group controls who can create
+  products. Everything else is open to any signed-in user.
+- **Rate limiting is off by default**, so upgrading doesn't suddenly start
+  rejecting traffic. Enable it with `RATE_LIMIT_PER_IP_RPS` and
+  `RATE_LIMIT_PER_SUBJECT_RPS`.
+- **One environment.** Post-deploy checks run against production. A staging
+  environment is the textbook answer; for a single-developer project it isn't
+  worth the cost.
 
-## Tech stack
+## Built with
 
-Go 1.26 · chi v5 · PostgreSQL 17 (pgx/v5 + sqlc) on [Neon](https://neon.tech) ·
-goose · Stripe (test mode) · Amazon Cognito · Docker · Terraform · GitHub
-Actions · Vite + React + TypeScript + Tailwind
+Go 1.26 · [chi](https://github.com/go-chi/chi) · PostgreSQL 17 ·
+[pgx](https://github.com/jackc/pgx) · [sqlc](https://sqlc.dev) ·
+[goose](https://github.com/pressly/goose) · [Neon](https://neon.tech) ·
+Stripe · AWS Cognito · React · TypeScript · Tailwind · Vite · Docker ·
+Terraform · GitHub Actions
 
-## Design notes
+---
 
-`CLAUDE.md` carries the full engineering log: why each decision was made, what
-was tried and rejected, and the remaining roadmap with its declined items struck
-through in place. [System design whiteboard](https://www.tldraw.com/f/UTNkBEuEvJF9yf0wjVOPS?d=v0.0.1660.989.page).
+Design decisions, things tried and rejected, and the reasoning behind the
+trade-offs above are recorded in [`CLAUDE.md`](CLAUDE.md).
