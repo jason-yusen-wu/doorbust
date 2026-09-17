@@ -6,9 +6,9 @@
   "absolute_throughput_valid": false,
   "note": "Tier 1: the generator shares CPU with the app and the database. Comparable between arms measured in the same session on this machine; never quotable as absolute throughput.",
   "meta": {
-    "git_sha": "99f64214efd5bf9301020ce8aa2216c2b142a9e0",
+    "git_sha": "37f7d84e21638dc6323366008f135569f40b8053",
     "git_dirty": false,
-    "session_id": "20260917T160000Z",
+    "session_id": "20260917T170000Z",
     "hostname": "Jasons-Mac-mini.local",
     "go_version": "go1.26.5",
     "os_arch": "darwin/arm64",
@@ -18,7 +18,7 @@
     "gogc": "400",
     "gomemlimit": "off",
     "rlimit_nofile": 9223372036854775807,
-    "started_at": "2026-09-17T15:44:16.997801Z"
+    "started_at": "2026-09-17T15:55:23.87872Z"
   },
   "db": {
     "server_version": "17.10",
@@ -28,7 +28,7 @@
     "shared_buffers": "128MB"
   },
   "app": {
-    "arm": "baseline",
+    "arm": "reserve-last",
     "customer_cache": false,
     "log_requests": false,
     "db_max_conns": 25,
@@ -37,11 +37,11 @@
     "stripe_event_poll_interval": "0s"
   },
   "model": {
-    "rtt_us": 98.25,
-    "commit_cost_us": 3.040999999999997,
-    "exec_us": 35,
-    "client_rtts_in_lock": 2,
-    "predicted_ceiling_per_sku": 4263.646867711829
+    "rtt_us": 90.541,
+    "commit_cost_us": 3.7510000000000048,
+    "exec_us": 38,
+    "client_rtts_in_lock": 1,
+    "predicted_ceiling_per_sku": 7559.036071720134
   },
   "workload": {
     "shape": "hot-deep",
@@ -55,33 +55,33 @@
   },
   "schedule": {
     "requests": 24000,
-    "lag_p50_us": 0.209,
-    "lag_p99_us": 21.584,
-    "lag_max_us": 361.25,
+    "lag_p50_us": 0.167,
+    "lag_p99_us": 19.542,
+    "lag_max_us": 443.083,
     "late_requests": 0,
     "late_fraction": 0,
     "generator_saturated": 0
   },
   "throughput": {
-    "goodput_per_s": 1653.3252123688967,
-    "accepted_per_s": 1653.3252123688967,
+    "goodput_per_s": 1999.922204359532,
+    "accepted_per_s": 1999.922204359532,
     "offered_per_s": 2000
   },
   "latency_us": {
     "overall": {
-      "p50": 1911087.5,
-      "p95": 2612431.709,
-      "p99": 2634885.5,
-      "p999": 2666107.209,
-      "max": 2724205.667,
+      "p50": 1249.417,
+      "p95": 1654.292,
+      "p99": 2056.917,
+      "p999": 5113.083,
+      "max": 12313,
       "count": 24000
     },
     "reserved": {
-      "p50": 1911087.5,
-      "p95": 2612431.709,
-      "p99": 2634885.5,
-      "p999": 2666107.209,
-      "max": 2724205.667,
+      "p50": 1249.417,
+      "p95": 1654.292,
+      "p99": 2056.917,
+      "p999": 5113.083,
+      "max": 12313,
       "count": 24000
     },
     "out_of_stock": {
@@ -93,15 +93,15 @@
       "count": 0
     },
     "service_overall": {
-      "p50": 1911087.333,
-      "p95": 2612431.459,
-      "p99": 2634885.458,
-      "p999": 2666107.125,
-      "max": 2724205.542,
+      "p50": 1246.667,
+      "p95": 1649.75,
+      "p99": 2053.583,
+      "p999": 5112.75,
+      "max": 12312.958,
       "count": 24000
     }
   },
-  "Outcomes": {
+  "outcomes": {
     "conflict_other": 0,
     "connect_error": 0,
     "generator_saturated": 0,
