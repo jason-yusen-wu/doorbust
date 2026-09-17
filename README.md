@@ -92,6 +92,39 @@ Three things worth saying plainly about that table:
    the guarantee — moved p50 at a fixed offered rate from 2.17 seconds to 376
    microseconds.
 
+### And on the real deployment
+
+Tier 1 runs on a laptop with everything on loopback. The honesty run puts the
+app on the deployed `t3.micro` with the database on Neon in the same region —
+a real network between the app and its rows.
+
+**At 500 reserves/s offered against one hot SKU:**
+
+| arm | goodput | p50 latency | outcome |
+| --- | --- | --- | --- |
+| `baseline` | 0.4/s | — | **7,989 of 8,000 requests timed out** |
+| `reserve-last` | 457.7/s | 1,394,532 µs | served, heavily queued |
+| `cte` | **500.0/s** | **2,845 µs** | served at the full offered rate |
+
+Two things about that table are worth more than the numbers.
+
+**The effect is larger in production than in the lab.** The lock window is
+denominated in *round trips*, and a real network round trip (measured: 642 µs)
+costs about six times a loopback one — so removing round trips from inside the
+lock buys more here, not less. The laptop was flattering the baseline.
+
+**The 642 µs is itself a finding.** This repo had assumed ~5 ms for a serverless
+Postgres and predicted, on that basis, that every arm would be pinned near
+100/s and indistinguishable. The assumption was wrong by a factor of eight,
+which is the argument for measuring a model's inputs in the same run as the
+model rather than looking them up once.
+
+Honest limits on this one: a `t3.micro` has two vCPUs, and above roughly
+500 rps the generator's own scheduling degrades because the app is using them —
+so those runs publish p50 through p99 and withhold p99.9, and the CTE ceiling
+(~776/s) is a bound the generator could not cleanly exceed rather than a plateau
+the server reached.
+
 ### What that bought, and what it replaced
 
 The original plan for contention was to put an admission gate in front of the
@@ -125,9 +158,17 @@ and exit non-zero. `valid`, `tier` and `absolute_throughput_valid` are required
 fields of the result schema, so a number cannot be copied out without the
 caveat that says what may be claimed from it.
 
-**These are Tier-1 numbers: the generator shares CPU with the app and the
-database.** They compare arms against each other on one machine. They are not
-absolute throughput, and the result files say so in their own text.
+**Tier 1 numbers compare arms against each other on one machine** — the
+generator shares CPU with the app and the database, so they are not absolute
+throughput, and the result files say so in their own text. Tier 2 numbers come
+from the deployed box against real Neon and are absolute, with their own
+caveats recorded the same way.
+
+A run also grades itself by *which percentiles it can support*. Each late send
+inflates one sample, so the share of late sends bounds which tail statistics the
+generator could have moved: above 1% p99 is contaminated and the run is void;
+above 0.1% only p99.9 is, and the summary prints `p99.9 (untrusted: N% late
+sends)` rather than a number the run cannot stand behind.
 
 ## Architecture
 
@@ -267,9 +308,12 @@ trade and most of them share a single root cause.
   cannot reach the box, so a poller lists `/v1/events` on a timer into the same
   inbox the webhook writes to. This needs no infrastructure and no dashboard
   configuration, and it catches up after an outage by construction.
-- **Throughput numbers are Tier-1**, measured with the generator sharing a
-  laptop with the app and the database. They compare arms; they are not absolute
-  capacity. There is no Tier-2 figure yet.
+- **The benchmark cannot saturate the deployed box cleanly.** A `t3.micro` has
+  two vCPUs, and co-locating an open-loop generator with a hard-working app
+  starves one of them. Tier-2 figures above ~500 rps withhold p99.9 for that
+  reason, and the CTE ceiling there is a lower bound rather than a measured
+  plateau. A separate generator instance would fix it and is not worth the money
+  for this project.
 - **One environment.** Every post-deploy check runs against production. The
   industry answer is a staging environment; for one box and one developer,
   making failures self-correcting is the cheaper substitute — and is not built
