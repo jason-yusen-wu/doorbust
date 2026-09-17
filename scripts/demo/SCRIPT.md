@@ -1,7 +1,8 @@
 # Demo script — the buyer's experience
 
-About four minutes. This is the product side: what someone actually sees and
-feels. No benchmarks, no SQL — the things a performance number can't show you.
+About four minutes, shot in **one take with no edits** — nothing here needs a
+server restart or a cut. This is the product side: what someone actually sees
+and feels. No benchmarks, no SQL.
 
 Narration is written to be spoken. Read it aloud once and change whatever
 doesn't sound like you.
@@ -18,9 +19,19 @@ the port first — `go run` leaves a child process behind that keeps answering
 after you think you've stopped it, which is how you end up filming a server
 running yesterday's settings.
 
-Two browser windows side by side. Sign in as `demo-alice` in one and
-`demo-bob` in the other — sessions are per-tab, so two ordinary windows keep
-separate logins. No incognito needed.
+**Logins** — two accounts, `demo-alice` and `demo-bob`, sharing one password.
+The password is deliberately not written down in this repo; set one you know:
+
+```bash
+DEMO_PASSWORD='pick-something' scripts/demo/users.sh
+```
+
+Run it any time to reset both accounts — it is safe to re-run.
+
+For the race in section 3, have two windows open side by side before you start
+recording — Alice in one, Bob in the other. Sessions are per-tab, so two
+ordinary windows keep separate logins; no incognito needed. If you'd rather keep
+it simple, skip section 3 and run the happy path in one window.
 
 **One thing to avoid on camera:** don't hard-refresh while you're on the orders
 list or an order page. Those two URLs are currently shadowed by the API and a
@@ -113,7 +124,7 @@ and retake.*
 
 ---
 
-## 5 · Paying (50s)
+## 5 · Paying (60s)
 
 **Do:** click through to checkout.
 
@@ -126,41 +137,44 @@ and retake.*
 
 > Watch this. I'm not refreshing.
 
-**Do:** wait for it to flip to completed.
+**Do:** wait — it flips to completed in about six seconds.
 
 > There it goes. *Payment received* became *confirming your unit*, and now it's
 > done.
 >
 > Nothing I clicked did that. Stripe confirmed the payment on its own schedule
 > and the app picked it up in the background. Which matters, because payments
-> genuinely do take a few seconds sometimes — and the page just tells you the
-> truth while it happens instead of pretending or hanging.
+> genuinely do take a few seconds — and the page tells you the truth while it
+> happens instead of hanging or pretending.
 
----
+### The two numbers (worth getting right)
 
-## 6 · The hold expires (40s) — optional but good
+**Do:** go back to the sale page for the shoe. Both numbers are on screen.
 
-**Do:** restart with a short fuse:
-
-```bash
-scripts/demo/server.sh --short-ttl
-```
-
-> Last thing about that hold. What if you reserve something and just… wander
-> off?
-
-**Do:** reserve something as Bob, don't pay, let the clock run out. Refresh the
-catalogue.
-
-> It's back. Somebody else can buy it now.
+> And here's the part I like. Two numbers, and they moved at different moments.
 >
-> That's on our clock, not the payment processor's. If Stripe went down
-> completely and never got back to us, that stock would still return. Nothing
-> gets stranded because a third party had a bad day.
+> **Remaining** dropped the instant I reserved — before I'd paid a penny.
+> That's the whole point of a hold: the unit left the shelf immediately so
+> nobody else could take it while I was getting my card out.
+>
+> **Run size** only dropped now, when the money actually arrived. That's the
+> count of units genuinely sold.
+>
+> So between reserving and paying, that unit belonged to nobody — it wasn't
+> available to anyone else, and it wasn't sold yet either. Most of the hard
+> problems in this project live in that gap.
 
----
+| | Remaining | Run size |
+| --- | --- | --- |
+| Before | 250 | 250 |
+| After reserve | **249** | 250 |
+| After payment | 249 | **249** |
 
-## 7 · Orders (20s)
+*Point at Run size for the payment beat, not Remaining. Remaining already moved
+back at reserve time and will not change again — pointing at it here is the one
+easy way to make a working demo look broken.*
+
+## 6 · Orders (20s)
 
 **Do:** click through to the orders list *(click — don't type the URL)*.
 
@@ -170,7 +184,7 @@ catalogue.
 
 ---
 
-## 8 · Close (25s)
+## 7 · Close (25s)
 
 > One thing I'd rather say than have you find.
 >
@@ -206,5 +220,6 @@ Handy for framing shots:
 | Catalogue looks wrong | `scripts/demo/seed.sh` |
 | Raw JSON on screen | You reloaded on `/orders` — navigate by clicking instead. |
 | Settings not applying, or the site looks stale/down | A leftover server still holds :8080. `scripts/demo/server.sh` clears it and restarts. |
-| Order stuck confirming | Stripe poll runs every 5s. Give it a beat. |
+| Order stuck confirming | Stripe poll runs every 5s; it lands in about 6. Give it a beat. |
+| Payment beat looked like nothing happened | You were watching *Remaining*. It moves at reserve; *Run size* is what moves at payment. |
 | Sign-in page won't load | See the Cognito managed-login note in `CLAUDE.md`. |
