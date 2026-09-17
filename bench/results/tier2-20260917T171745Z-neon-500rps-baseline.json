@@ -1,0 +1,145 @@
+{
+  "schema": 1,
+  "tier": 2,
+  "valid": false,
+  "invalid_reasons": [
+    "p99 schedule lag 8118us exceeds 1ms: the generator could not keep to its own schedule",
+    "537 of 8000 sends (6.71%) missed their deadline by over 1ms, enough to move p99",
+    "4 server errors: the run hit a real failure, not a load limit"
+  ],
+  "absolute_throughput_valid": true,
+  "note": "Tier 2: generator on the app's own box against a remote database. Absolute, but the generator shares the instance's CPU and the instance is burstable — keep runs short enough that CPU credits are not what is being measured. Durability control run: synchronous_commit=on, so commit cost dominates and arms are expected to converge.",
+  "meta": {
+    "git_sha": "0fdd798986886c68ec6dd93a805445c72d9f4ed7",
+    "git_dirty": false,
+    "session_id": "tier2-20260917T171745Z",
+    "hostname": "ip-172-31-27-144.us-east-2.compute.internal",
+    "go_version": "go1.26.5",
+    "os_arch": "linux/amd64",
+    "num_cpu": 2,
+    "app_gomaxprocs": 1,
+    "bench_gomaxprocs": 1,
+    "gogc": "100",
+    "gomemlimit": "off",
+    "rlimit_nofile": 65535,
+    "started_at": "2026-09-17T17:17:46.077291216Z"
+  },
+  "db": {
+    "server_version": "18.6 (2078fcb)",
+    "synchronous_commit": "on",
+    "fsync": "off",
+    "max_connections": "901",
+    "shared_buffers": "230MB"
+  },
+  "app": {
+    "arm": "baseline",
+    "customer_cache": false,
+    "log_requests": false,
+    "db_max_conns": 25,
+    "reservation_ttl": "24h",
+    "sweep_interval": "24h",
+    "stripe_event_poll_interval": "0s"
+  },
+  "model": {
+    "rtt_us": 694.478,
+    "commit_cost_us": 7.6030000000000655,
+    "exec_us": 63,
+    "client_rtts_in_lock": 2,
+    "predicted_ceiling_per_sku": 685.1384562049221
+  },
+  "workload": {
+    "shape": "hot-deep",
+    "arrivals": "fixed",
+    "target_rate": 500,
+    "skus": 1,
+    "initial_quantity": 101000,
+    "buyers": 100,
+    "duration_s": 20,
+    "warmup_s": 4
+  },
+  "schedule": {
+    "requests": 8000,
+    "lag_p50_us": 0.272,
+    "lag_p99_us": 8117.515,
+    "lag_max_us": 37357.253,
+    "late_requests": 537,
+    "late_fraction": 0.067125,
+    "trusted_percentile": "none",
+    "generator_saturated": 0
+  },
+  "throughput": {
+    "goodput_per_s": 0.3684572344532653,
+    "accepted_per_s": 0.3684572344532653,
+    "offered_per_s": 500
+  },
+  "latency_us": {
+    "overall": {
+      "p50": 3000233.358,
+      "p95": 3005020.975,
+      "p99": 3013769.555,
+      "p999": 3026064.242,
+      "max": 3037736.702,
+      "count": 8000
+    },
+    "reserved": {
+      "p50": 2996677.743,
+      "p95": 3017313.648,
+      "p99": 3017313.648,
+      "p999": 3017313.648,
+      "max": 3017313.648,
+      "count": 7
+    },
+    "out_of_stock": {
+      "p50": 0,
+      "p95": 0,
+      "p99": 0,
+      "p999": 0,
+      "max": 0,
+      "count": 0
+    },
+    "service_overall": {
+      "p50": 3000226.352,
+      "p95": 3002660.045,
+      "p99": 3009219.073,
+      "p999": 3019318.712,
+      "max": 3024282.917,
+      "count": 8000
+    }
+  },
+  "outcomes": {
+    "conflict_other": 0,
+    "connect_error": 0,
+    "generator_saturated": 0,
+    "not_found": 0,
+    "out_of_stock": 0,
+    "reserved": 7,
+    "server_error": 4,
+    "timeout": 7989,
+    "unauthorized": 0
+  },
+  "invariants": {
+    "passed": true,
+    "checks": [
+      {
+        "name": "client_server_order_count",
+        "ok": true
+      },
+      {
+        "name": "num_reserved_non_negative",
+        "ok": true
+      },
+      {
+        "name": "num_reserved_within_quantity",
+        "ok": true
+      },
+      {
+        "name": "reserved_matches_live_orders",
+        "ok": true
+      },
+      {
+        "name": "orders_within_initial_quantity",
+        "ok": true
+      }
+    ]
+  }
+}
