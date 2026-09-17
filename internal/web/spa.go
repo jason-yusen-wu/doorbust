@@ -30,8 +30,14 @@ const indexFile = "index.html"
 // `go build ./...`, `make server` and the build CI job for anyone who has not
 // run the frontend build. A missing directory degrades to a JSON 404 instead.
 //
-// distDir is resolved once, at mount. Building the frontend while the server is
-// already running therefore needs a restart.
+// distDir is opened once, at mount, but every file is read through that handle
+// per request — so `npm run build` against a running server IS picked up
+// without a restart. `vite build` empties dist rather than replacing the
+// directory, so the handle stays valid.
+//
+// The one case that does need a restart is the directory itself being deleted
+// and recreated (`rm -rf dist`), which leaves the handle pointing at the old
+// inode and turns every request into the JSON 404 below.
 func Handler(distDir string) http.Handler {
 	root, err := os.OpenRoot(distDir)
 	if err != nil {
