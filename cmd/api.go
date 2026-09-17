@@ -224,6 +224,13 @@ func (app *application) run(h http.Handler) error {
 
 	g, gctx := errgroup.WithContext(ctx)
 
+	// The profiler is not a background job: those return errors that bring the
+	// process down through the errgroup, and a diagnostic listener failing is
+	// not a reason to stop selling things.
+	if pprofSrv := newPprofServer(app.config.pprofAddr); pprofSrv != nil {
+		g.Go(func() error { return runPprof(gctx, pprofSrv) })
+	}
+
 	for _, job := range app.background {
 		g.Go(func() error {
 			if err := job.run(gctx); err != nil {
@@ -310,6 +317,10 @@ type config struct {
 	// on every request is a global lock and a syscall sitting on the exact path
 	// being measured.
 	logRequests bool
+
+	// pprofAddr serves Go's runtime profiler on a loopback-only listener.
+	// Empty disables it entirely — see newPprofServer.
+	pprofAddr string
 }
 
 type rateLimitConfig struct {

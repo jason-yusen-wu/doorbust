@@ -205,7 +205,8 @@ carries a resolution. The measurement exists, the bake-off ran, and B5's gate
 closed on a number rather than on taste — see `bench/results/` and the README.
 Struck-through items are settled, done or declined; the reasoning is kept rather
 than deleted so the decision stays made. The honesty run against the deployed
-box is done (A3). **One thing remains open**: a loopback `pprof` listener (A4).
+box is done (A3), and the loopback `pprof` listener is done (A4). **Nothing in
+Tracks A or B remains open.**
 
 #### Track A — Measurement (nothing in Track B means anything until this exists)
 
@@ -227,7 +228,7 @@ box is done (A3). **One thing remains open**: a loopback `pprof` listener (A4).
 - ~~**A4. Observability — OpenTelemetry → Prometheus → Grafana.** OTel SDK with a Prometheus exporter: RED metrics per route, `pgxpool.Stat()` gauges (the pool defaults to 25 connections and nothing currently reports whether *it* is the bottleneck), reserve-outcome counters split `reserved` / `out_of_stock` / `conflict`, and worker/sweeper/poller lag. Sampled OTLP traces spanning handler → service → pgx, to show where the time inside the reserve transaction actually goes. Prometheus + Grafana via docker-compose on the bench box.~~
   - ~~**Measure the observability tax and write the number down.** Run one strategy arm with instrumentation on and off. If tracing perturbs what it is measuring, sampling drops or traces go off for measurement runs — the instrumentation is for the dashboards and the résumé, and it must not be allowed to become the thing being benchmarked.~~
   - ~~`net/http/pprof` on a **loopback-only** listener (`127.0.0.1:6060`), reached by SSM port-forwarding. No security-group change and no public exposure.~~
-  - **Resolution — Declined, except `pprof`.** Full OTel → Prometheus → Grafana is a separate project, and the benchmark produces the numbers the README quotes. The loopback-only `pprof` listener is still worth having and is not built.
+  - **Resolution — Declined, except `pprof`, which is done.** Full OTel → Prometheus → Grafana remains a separate project; the benchmark produces the numbers the README quotes. `PPROF_ADDR` now serves the profiler on its **own** listener, forced onto 127.0.0.1 whatever is configured — `:6060`, the form every Go example shows, would otherwise bind every interface. It is deliberately not a route group on the main router: those handlers dump the heap and every goroutine stack to anyone who reaches them, `TestEveryRouteIsClassified` would demand an access level, and there is no honest answer. Off by default, since profiling perturbs the process it measures.
 
 #### Track B — The contention ceiling
 

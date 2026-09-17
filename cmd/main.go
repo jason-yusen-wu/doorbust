@@ -91,6 +91,11 @@ func main() {
 
 		// On unless a benchmark turns it off. See config.logRequests.
 		logRequests: env.GetBool("LOG_REQUESTS", true),
+
+		// Off by default. Set PPROF_ADDR=127.0.0.1:6060 when investigating;
+		// the listener is forced onto loopback whatever is configured, so it
+		// cannot be exposed by a typo.
+		pprofAddr: env.GetString("PPROF_ADDR", ""),
 	}
 
 	// structured (text based) logger as global logger
