@@ -11,6 +11,9 @@ succeed, and you find out when a customer emails about an order you can't ship.
 Doorbust solves that with one small idea, applied consistently, and then
 measures the result instead of asserting it.
 
+https://github.com/user-attachments/assets/95b81884-d77a-4e98-9e52-40f7f5c0840e
+
+
 ---
 
 ## Contents
@@ -92,8 +95,8 @@ transaction, and the row stayed locked for the last two of them. While locked,
 every other buyer for that item waits. So the ceiling is roughly:
 
 ```
-                    1
-  ───────────────────────────────────────
+                              1
+  ───────────────────────────────────────-----------------
   (round trips while locked × network RTT) + database work
 ```
 
