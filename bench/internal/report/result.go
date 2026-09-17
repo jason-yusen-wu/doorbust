@@ -45,17 +45,17 @@ type Result struct {
 	AbsoluteThroughputValid bool   `json:"absolute_throughput_valid"`
 	Note                    string `json:"note"`
 
-	Meta       Meta       `json:"meta"`
-	DB         DBInfo     `json:"db"`
-	App        AppInfo    `json:"app"`
-	Model      Model      `json:"model"`
-	Workload   Workload   `json:"workload"`
-	Schedule   Schedule   `json:"schedule"`
-	Through    Throughput `json:"throughput"`
-	Latency    Latencies  `json:"latency_us"`
-	Outcomes   map[string]int64
-	Invariants Invariants  `json:"invariants"`
-	Saturation *Saturation `json:"saturation_check,omitempty"`
+	Meta       Meta             `json:"meta"`
+	DB         DBInfo           `json:"db"`
+	App        AppInfo          `json:"app"`
+	Model      Model            `json:"model"`
+	Workload   Workload         `json:"workload"`
+	Schedule   Schedule         `json:"schedule"`
+	Through    Throughput       `json:"throughput"`
+	Latency    Latencies        `json:"latency_us"`
+	Outcomes   map[string]int64 `json:"outcomes"`
+	Invariants Invariants       `json:"invariants"`
+	Saturation *Saturation      `json:"saturation_check,omitempty"`
 }
 
 // Model is B1: the analytic prediction, measured in the same run as the thing
