@@ -285,3 +285,41 @@ SELECT
     sqlc.arg(expires_at)::timestamptz
 FROM priced
 RETURNING *;
+
+-- name: ClaimIdempotencyKey :one
+-- Claims a key, or reports that someone else already holds it.
+--
+-- The same guarded-write idiom the rest of this project rests on: the insert
+-- either wins or matches zero rows, and zero rows means a concurrent caller got
+-- there first. No lock, no read-then-write race.
+INSERT INTO order_idempotency (cognito_sub, idem_key, request_hash)
+VALUES ($1, $2, $3)
+ON CONFLICT (cognito_sub, idem_key) DO NOTHING
+RETURNING *;
+
+-- name: FindIdempotencyKey :one
+-- Read the winner's row after losing the claim above.
+SELECT * FROM order_idempotency
+WHERE cognito_sub = $1 AND idem_key = $2;
+
+-- name: CompleteIdempotencyKey :exec
+-- Records which order the key produced, so a later retry can return it.
+-- Guarded on order_id IS NULL so a replay can never overwrite the first answer.
+UPDATE order_idempotency
+SET order_id = $3
+WHERE cognito_sub = $1 AND idem_key = $2 AND order_id IS NULL;
+
+-- name: ReleaseIdempotencyKey :exec
+-- Frees a key whose reserve failed, so the caller can retry.
+-- Guarded on order_id IS NULL: a key that produced an order is never released.
+DELETE FROM order_idempotency
+WHERE cognito_sub = $1 AND idem_key = $2 AND order_id IS NULL;
+
+-- name: FindOrderByIDPlain :one
+-- The orders row on its own, with no customer or product join.
+--
+-- FindOrderByID exists for the ownership check and carries the joined customer
+-- for that reason. The idempotent replay path has already authenticated the
+-- caller by the key's own scope — a key is looked up under the caller's own
+-- Cognito subject — so it needs the order, not the join.
+SELECT * FROM orders WHERE id = $1;

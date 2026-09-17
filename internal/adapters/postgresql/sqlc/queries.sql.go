@@ -38,6 +38,37 @@ func (q *Queries) CancelPendingOrder(ctx context.Context, id int64) (Order, erro
 	return i, err
 }
 
+const claimIdempotencyKey = `-- name: ClaimIdempotencyKey :one
+INSERT INTO order_idempotency (cognito_sub, idem_key, request_hash)
+VALUES ($1, $2, $3)
+ON CONFLICT (cognito_sub, idem_key) DO NOTHING
+RETURNING cognito_sub, idem_key, request_hash, order_id, created_at
+`
+
+type ClaimIdempotencyKeyParams struct {
+	CognitoSub  string `json:"cognito_sub"`
+	IdemKey     string `json:"idem_key"`
+	RequestHash string `json:"request_hash"`
+}
+
+// Claims a key, or reports that someone else already holds it.
+//
+// The same guarded-write idiom the rest of this project rests on: the insert
+// either wins or matches zero rows, and zero rows means a concurrent caller got
+// there first. No lock, no read-then-write race.
+func (q *Queries) ClaimIdempotencyKey(ctx context.Context, arg ClaimIdempotencyKeyParams) (OrderIdempotency, error) {
+	row := q.db.QueryRow(ctx, claimIdempotencyKey, arg.CognitoSub, arg.IdemKey, arg.RequestHash)
+	var i OrderIdempotency
+	err := row.Scan(
+		&i.CognitoSub,
+		&i.IdemKey,
+		&i.RequestHash,
+		&i.OrderID,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const claimNextStripeEvent = `-- name: ClaimNextStripeEvent :one
 SELECT id, type, payload, received_at, processed_at, attempts, last_error, stripe_created_at FROM stripe_events
 WHERE processed_at IS NULL AND attempts < $1
@@ -88,6 +119,25 @@ func (q *Queries) CommitStock(ctx context.Context, productID int64) (Stock, erro
 		&i.NumReserved,
 	)
 	return i, err
+}
+
+const completeIdempotencyKey = `-- name: CompleteIdempotencyKey :exec
+UPDATE order_idempotency
+SET order_id = $3
+WHERE cognito_sub = $1 AND idem_key = $2 AND order_id IS NULL
+`
+
+type CompleteIdempotencyKeyParams struct {
+	CognitoSub string      `json:"cognito_sub"`
+	IdemKey    string      `json:"idem_key"`
+	OrderID    pgtype.Int8 `json:"order_id"`
+}
+
+// Records which order the key produced, so a later retry can return it.
+// Guarded on order_id IS NULL so a replay can never overwrite the first answer.
+func (q *Queries) CompleteIdempotencyKey(ctx context.Context, arg CompleteIdempotencyKeyParams) error {
+	_, err := q.db.Exec(ctx, completeIdempotencyKey, arg.CognitoSub, arg.IdemKey, arg.OrderID)
+	return err
 }
 
 const completeOrder = `-- name: CompleteOrder :one
@@ -302,6 +352,30 @@ func (q *Queries) FindCustomerBySub(ctx context.Context, cognitoSub pgtype.Text)
 	return i, err
 }
 
+const findIdempotencyKey = `-- name: FindIdempotencyKey :one
+SELECT cognito_sub, idem_key, request_hash, order_id, created_at FROM order_idempotency
+WHERE cognito_sub = $1 AND idem_key = $2
+`
+
+type FindIdempotencyKeyParams struct {
+	CognitoSub string `json:"cognito_sub"`
+	IdemKey    string `json:"idem_key"`
+}
+
+// Read the winner's row after losing the claim above.
+func (q *Queries) FindIdempotencyKey(ctx context.Context, arg FindIdempotencyKeyParams) (OrderIdempotency, error) {
+	row := q.db.QueryRow(ctx, findIdempotencyKey, arg.CognitoSub, arg.IdemKey)
+	var i OrderIdempotency
+	err := row.Scan(
+		&i.CognitoSub,
+		&i.IdemKey,
+		&i.RequestHash,
+		&i.OrderID,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const findOrderByID = `-- name: FindOrderByID :one
 SELECT o.id, o.customer_id, o.product_id, o.status, o.created_at, o.total_in_cents, o.expires_at, o.stripe_payment_intent_id, c.email AS customer_email, c.cognito_sub AS customer_cognito_sub
 FROM orders o
@@ -339,6 +413,32 @@ func (q *Queries) FindOrderByID(ctx context.Context, id int64) (FindOrderByIDRow
 		&i.StripePaymentIntentID,
 		&i.CustomerEmail,
 		&i.CustomerCognitoSub,
+	)
+	return i, err
+}
+
+const findOrderByIDPlain = `-- name: FindOrderByIDPlain :one
+SELECT id, customer_id, product_id, status, created_at, total_in_cents, expires_at, stripe_payment_intent_id FROM orders WHERE id = $1
+`
+
+// The orders row on its own, with no customer or product join.
+//
+// FindOrderByID exists for the ownership check and carries the joined customer
+// for that reason. The idempotent replay path has already authenticated the
+// caller by the key's own scope — a key is looked up under the caller's own
+// Cognito subject — so it needs the order, not the join.
+func (q *Queries) FindOrderByIDPlain(ctx context.Context, id int64) (Order, error) {
+	row := q.db.QueryRow(ctx, findOrderByIDPlain, id)
+	var i Order
+	err := row.Scan(
+		&i.ID,
+		&i.CustomerID,
+		&i.ProductID,
+		&i.Status,
+		&i.CreatedAt,
+		&i.TotalInCents,
+		&i.ExpiresAt,
+		&i.StripePaymentIntentID,
 	)
 	return i, err
 }
@@ -684,6 +784,23 @@ type MarkStripeEventProcessedParams struct {
 // behind is what makes them findable.
 func (q *Queries) MarkStripeEventProcessed(ctx context.Context, arg MarkStripeEventProcessedParams) error {
 	_, err := q.db.Exec(ctx, markStripeEventProcessed, arg.ID, arg.LastError)
+	return err
+}
+
+const releaseIdempotencyKey = `-- name: ReleaseIdempotencyKey :exec
+DELETE FROM order_idempotency
+WHERE cognito_sub = $1 AND idem_key = $2 AND order_id IS NULL
+`
+
+type ReleaseIdempotencyKeyParams struct {
+	CognitoSub string `json:"cognito_sub"`
+	IdemKey    string `json:"idem_key"`
+}
+
+// Frees a key whose reserve failed, so the caller can retry.
+// Guarded on order_id IS NULL: a key that produced an order is never released.
+func (q *Queries) ReleaseIdempotencyKey(ctx context.Context, arg ReleaseIdempotencyKeyParams) error {
+	_, err := q.db.Exec(ctx, releaseIdempotencyKey, arg.CognitoSub, arg.IdemKey)
 	return err
 }
 

@@ -16,6 +16,12 @@ type Querier interface {
 	// still pay it, so cancelling would need a refund path. Those orders are left
 	// to expire instead.
 	CancelPendingOrder(ctx context.Context, id int64) (Order, error)
+	// Claims a key, or reports that someone else already holds it.
+	//
+	// The same guarded-write idiom the rest of this project rests on: the insert
+	// either wins or matches zero rows, and zero rows means a concurrent caller got
+	// there first. No lock, no read-then-write race.
+	ClaimIdempotencyKey(ctx context.Context, arg ClaimIdempotencyKeyParams) (OrderIdempotency, error)
 	// One event per transaction: a poisoned payload then fails only itself
 	// instead of rolling back a whole batch. SKIP LOCKED lets concurrent workers
 	// (or a future second box) drain the queue without double-processing.
@@ -27,6 +33,9 @@ type Querier interface {
 	// Finalizes a reservation at checkout: moves one unit out of quantity and
 	// releases the matching reservation.
 	CommitStock(ctx context.Context, productID int64) (Stock, error)
+	// Records which order the key produced, so a later retry can return it.
+	// Guarded on order_id IS NULL so a replay can never overwrite the first answer.
+	CompleteIdempotencyKey(ctx context.Context, arg CompleteIdempotencyKeyParams) error
 	// Guarded by status = 'awaiting_payment' so a redelivered webhook can only
 	// ever commit stock once for a given order. Stripe delivers at-least-once;
 	// this WHERE clause is what makes that safe without a distributed lock.
@@ -58,10 +67,19 @@ type Querier interface {
 	// reach the insert below with a new email, conflict on cognito_sub rather than
 	// email, and be permanently unable to use the app.
 	FindCustomerBySub(ctx context.Context, cognitoSub pgtype.Text) (Customer, error)
+	// Read the winner's row after losing the claim above.
+	FindIdempotencyKey(ctx context.Context, arg FindIdempotencyKeyParams) (OrderIdempotency, error)
 	// Joins the owning customer's identity so callers can check ownership without
 	// a second round trip. cognito_sub is preferred over email for that check;
 	// it is NULL only for customers who predate the column.
 	FindOrderByID(ctx context.Context, id int64) (FindOrderByIDRow, error)
+	// The orders row on its own, with no customer or product join.
+	//
+	// FindOrderByID exists for the ownership check and carries the joined customer
+	// for that reason. The idempotent replay path has already authenticated the
+	// caller by the key's own scope — a key is looked up under the caller's own
+	// Cognito subject — so it needs the order, not the join.
+	FindOrderByIDPlain(ctx context.Context, id int64) (Order, error)
 	// The Stripe webhook's only handle back to an order.
 	FindOrderByPaymentIntentID(ctx context.Context, stripePaymentIntentID pgtype.Text) (FindOrderByPaymentIntentIDRow, error)
 	FindProductByID(ctx context.Context, id int64) (FindProductByIDRow, error)
@@ -109,6 +127,9 @@ type Querier interface {
 	// expired. Retrying those forever would spin the worker; leaving the message
 	// behind is what makes them findable.
 	MarkStripeEventProcessed(ctx context.Context, arg MarkStripeEventProcessedParams) error
+	// Frees a key whose reserve failed, so the caller can retry.
+	// Guarded on order_id IS NULL: a key that produced an order is never released.
+	ReleaseIdempotencyKey(ctx context.Context, arg ReleaseIdempotencyKeyParams) error
 	// The other way a reservation ends: cancelled, payment failed, or expired.
 	// Puts the unit back on sale without touching quantity. Guarded on
 	// num_reserved > 0 so a double release can't drive the counter negative.

@@ -30,7 +30,7 @@ func TestReserveContractIsIdenticalAcrossStrategies(t *testing.T) {
 			ctx := context.Background()
 
 			t.Run("missing product is ErrNoRows", func(t *testing.T) {
-				_, err := service.CreateOrder(ctx, 999999, buyer(1))
+				_, err := service.CreateOrder(ctx, CreateOrderParams{ProductID: 999999, Claims: buyer(1)})
 				if !errors.Is(err, pgx.ErrNoRows) {
 					t.Fatalf("reserving a nonexistent product: got %v, want pgx.ErrNoRows (the handler's 404)", err)
 				}
@@ -39,11 +39,11 @@ func TestReserveContractIsIdenticalAcrossStrategies(t *testing.T) {
 			t.Run("depleted product is ErrOutOfStock", func(t *testing.T) {
 				productID := testsupport.SeedProduct(t, pool, "one-unit", 100, 1)
 
-				if _, err := service.CreateOrder(ctx, productID, buyer(2)); err != nil {
+				if _, err := service.CreateOrder(ctx, CreateOrderParams{ProductID: productID, Claims: buyer(2)}); err != nil {
 					t.Fatalf("first reserve should succeed: %v", err)
 				}
 
-				_, err := service.CreateOrder(ctx, productID, buyer(3))
+				_, err := service.CreateOrder(ctx, CreateOrderParams{ProductID: productID, Claims: buyer(3)})
 				if !errors.Is(err, ErrOutOfStock) {
 					t.Fatalf("reserving a depleted product: got %v, want ErrOutOfStock (the handler's 409)", err)
 				}

@@ -58,7 +58,7 @@ type CheckoutResult struct {
 type Service interface {
 	GetOrder(ctx context.Context, id int64, claims auth.Claims) (repo.FindOrderByIDRow, error)
 	ListOrders(ctx context.Context, claims auth.Claims, limit, offset int32) ([]repo.ListOrdersByCustomerRow, error)
-	CreateOrder(ctx context.Context, productID int64, claims auth.Claims) (repo.Order, error)
+	CreateOrder(ctx context.Context, p CreateOrderParams) (repo.Order, error)
 	Checkout(ctx context.Context, orderID int64, claims auth.Claims) (CheckoutResult, error)
 	CancelOrder(ctx context.Context, orderID int64, claims auth.Claims) (repo.Order, error)
 
@@ -152,11 +152,21 @@ func (s *svc) linkCustomer(ctx context.Context, q repo.Querier, claims auth.Clai
 // differ, and is fixed here, is the expiry stamp: every arm reads the clock
 // once, in the same place, so a benchmark comparing them is not also comparing
 // two different TTLs.
-func (s *svc) CreateOrder(ctx context.Context, productID int64, claims auth.Claims) (repo.Order, error) {
+// CreateOrderParams is what the handler collects from one request. A struct
+// rather than a longer argument list because the idempotency key is optional
+// and positional booleans and strings at a call site age badly.
+type CreateOrderParams struct {
+	ProductID      int64
+	Claims         auth.Claims
+	IdempotencyKey string
+}
+
+func (s *svc) CreateOrder(ctx context.Context, p CreateOrderParams) (repo.Order, error) {
 	return s.reserve.Reserve(ctx, ReserveParams{
-		ProductID: productID,
-		Claims:    claims,
-		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(s.reservationTTL), Valid: true},
+		ProductID:      p.ProductID,
+		Claims:         p.Claims,
+		IdempotencyKey: p.IdempotencyKey,
+		ExpiresAt:      pgtype.Timestamptz{Time: time.Now().Add(s.reservationTTL), Valid: true},
 	})
 }
 

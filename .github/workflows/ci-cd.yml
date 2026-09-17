@@ -153,7 +153,7 @@ jobs:
 
       # -race matters here: the whole point of the suite is concurrent access.
       # -shuffle=on catches order dependence, which per-test database isolation
-      # is what makes survivable. -coverpkg=./... is required or the HTTP tests
+      # is what makes survivable. -coverpkg is required or the HTTP tests
       # in cmd credit none of their coverage to the packages they exercise.
       # -count=1 defeats the test cache, which `setup-go` restores between
       # runs: without it a green result can come from a previous commit's
@@ -161,7 +161,7 @@ jobs:
       - name: go test
         run: |
           go test -race -shuffle=on -count=1 -timeout=10m \
-            -coverpkg=./... -coverprofile=coverage.out ./...
+            -coverpkg=./internal/...,./cmd/... -coverprofile=coverage.out ./internal/... ./cmd/...
 
       # Per-package floors rather than one repo-wide number: a global figure is
       # dominated by generated sqlc code and cmd wiring, so it can be met while

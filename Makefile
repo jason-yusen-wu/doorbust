@@ -57,14 +57,18 @@ test-db-stop:
 test-all:
 	TEST_DATABASE_URL="$(TEST_DATABASE_URL)" go test -race -shuffle=on -timeout=5m ./...
 
-# Coverage with the per-package floors enforced. -coverpkg=./... is required
-# or the HTTP tests in cmd would credit none of their coverage to the packages
-# they actually exercise.
+# Coverage with the per-package floors enforced. -coverpkg is required or the
+# HTTP tests in cmd would credit none of their coverage to the packages they
+# actually exercise.
+#
+# Scoped to internal/ and cmd/ rather than ./...: bench/ is a measurement tool
+# with no floor, and including it drags the reported total down by tens of
+# points while telling you nothing about the code the floors are protecting.
 # -count=1 defeats the test cache. A gate that can report a cached result is
 # not a gate: an unrelated change would leave it green against stale coverage.
 cover:
 	TEST_DATABASE_URL="$(TEST_DATABASE_URL)" go test -race -count=1 -timeout=5m \
-		-coverpkg=./... -coverprofile=coverage.out ./...
+		-coverpkg=./internal/...,./cmd/... -coverprofile=coverage.out ./internal/... ./cmd/...
 	@./scripts/check-coverage.sh coverage.out
 
 # --- Benchmarks (Track A) -------------------------------------------------

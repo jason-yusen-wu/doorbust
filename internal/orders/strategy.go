@@ -48,6 +48,11 @@ type ReserveParams struct {
 	ProductID int64
 	Claims    auth.Claims
 	ExpiresAt pgtype.Timestamptz
+
+	// IdempotencyKey is the caller's Idempotency-Key header, empty when they
+	// did not send one. Only the idempotent wrapper reads it; the arms
+	// themselves neither see nor care about it.
+	IdempotencyKey string
 }
 
 // The arm names. These are configuration values (RESERVE_STRATEGY) and appear

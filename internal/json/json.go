@@ -43,7 +43,14 @@ const (
 	CodeConflict        = "conflict"
 	CodeOutOfStock      = "out_of_stock"
 	CodeOrderNotPending = "order_not_pending"
-	CodeInternal        = "internal_error"
+	// CodeIdempotencyKeyReused: the key was replayed with a different body.
+	CodeIdempotencyKeyReused = "idempotency_key_reused"
+	// CodeReserveInProgress: an earlier request holding the same key has not
+	// finished. Distinct from the above because this one is retriable.
+	CodeReserveInProgress = "reserve_in_progress"
+	CodeInternal          = "internal_error"
+	// CodeRateLimited: the caller is over their request budget. Retriable.
+	CodeRateLimited = "rate_limited"
 )
 
 // WriteError replaces http.Error, which writes text/plain and would leave the

@@ -27,6 +27,15 @@ type contextKey int
 
 const claimsContextKey contextKey = iota
 
+// NewContext attaches a caller's identity to a context.
+//
+// Middleware is the only production caller; it is exported so that code which
+// reads identity — rate limiting, handlers — can be tested without minting and
+// verifying a real token for cases that are not about token verification.
+func NewContext(ctx context.Context, claims Claims) context.Context {
+	return context.WithValue(ctx, claimsContextKey, claims)
+}
+
 // FromContext returns the caller's identity, set by Middleware.
 func FromContext(ctx context.Context) (Claims, bool) {
 	claims, ok := ctx.Value(claimsContextKey).(Claims)

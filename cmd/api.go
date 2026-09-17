@@ -21,6 +21,7 @@ import (
 	"github.com/jason-yusen-wu/doorbust/internal/orders"
 	"github.com/jason-yusen-wu/doorbust/internal/payments"
 	"github.com/jason-yusen-wu/doorbust/internal/products"
+	"github.com/jason-yusen-wu/doorbust/internal/ratelimit"
 	"github.com/jason-yusen-wu/doorbust/internal/web"
 	"github.com/stripe/stripe-go/v83"
 	"golang.org/x/sync/errgroup"
@@ -50,12 +51,20 @@ func (app *application) mount() http.Handler {
 		r.Use(cors.Handler(cors.Options{
 			AllowedOrigins: app.config.corsAllowedOrigins,
 			AllowedMethods: []string{http.MethodGet, http.MethodPost, http.MethodDelete, http.MethodOptions},
-			AllowedHeaders: []string{"Authorization", "Content-Type"},
+			AllowedHeaders: []string{"Authorization", "Content-Type", "Idempotency-Key"},
 			// We authenticate with a bearer token, not a cookie. Allowing
 			// credentials would also forbid a wildcard origin, and buys nothing.
 			AllowCredentials: false,
 			MaxAge:           300,
 		}))
+	}
+
+	// Rate limiting sits above everything, including the storefront and the
+	// public product reads: an unauthenticated scraper is exactly the traffic
+	// it exists to shed, and it must run before any database work happens.
+	ipLimiter := ratelimit.New(app.config.rateLimit.perIP, app.config.rateLimit.burst, app.config.rateLimit.idle)
+	if ipLimiter.Enabled() {
+		r.Use(ipLimiter.Middleware(ratelimit.ByIP))
 	}
 
 	queries := repo.New(app.db)
@@ -95,6 +104,9 @@ func (app *application) mount() http.Handler {
 	if err != nil {
 		panic(err)
 	}
+	if app.config.orders.idempotency {
+		reserve = orders.WithIdempotency(reserve, queries)
+	}
 
 	orderService := orders.NewService(queries, app.db, gateway, reserve, app.config.orders.reservationTTL)
 	orderHandler := orders.NewHandler(orderService)
@@ -110,6 +122,15 @@ func (app *application) mount() http.Handler {
 	// writes require a verified Cognito caller
 	r.Group(func(r chi.Router) {
 		r.Use(app.auth.Middleware)
+
+		// Per-identity limiting has to sit inside the auth group: the subject
+		// only exists on the context once the token has been verified.
+		subjectLimiter := ratelimit.New(
+			app.config.rateLimit.perSubject, app.config.rateLimit.burst, app.config.rateLimit.idle)
+		if subjectLimiter.Enabled() {
+			r.Use(subjectLimiter.Middleware(ratelimit.BySubject))
+		}
+
 		r.Get("/me", customerHandler.GetMe)
 
 		// Creating a sale is a vendor action, not something any signed-up
@@ -272,6 +293,11 @@ type config struct {
 	orders          ordersConfig
 	payments        paymentsConfig
 
+	// rateLimit bounds how fast one caller may reserve. Zero disables it,
+	// which is what a benchmark run wants — otherwise the limiter, not the
+	// reserve path, is what gets measured.
+	rateLimit rateLimitConfig
+
 	// corsAllowedOrigins is empty in production, where the frontend is served
 	// from this process and nothing is cross-origin. Empty disables CORS.
 	corsAllowedOrigins []string
@@ -284,6 +310,17 @@ type config struct {
 	// on every request is a global lock and a syscall sitting on the exact path
 	// being measured.
 	logRequests bool
+}
+
+type rateLimitConfig struct {
+	// perIP applies to everyone, including unauthenticated browsing.
+	perIP float64
+	// perSubject applies to a signed-in caller, so one account cannot spread
+	// its load across addresses. Usually tighter than perIP, since a household
+	// or an office may legitimately share an address.
+	perSubject float64
+	burst      int
+	idle       time.Duration
 }
 
 type cognitoConfig struct {
@@ -315,6 +352,12 @@ type ordersConfig struct {
 	// lookup off the reserve path (R1). Off by default: the cache is currently
 	// unbounded, which is fine for a benchmark and not for production.
 	customerCache bool
+
+	// idempotency makes POST /orders safe to retry when the caller sends an
+	// Idempotency-Key. On by default — a retry reserving a second unit is a
+	// real bug, not a tuning choice — but switchable so its cost on the hot
+	// path can be measured as its own benchmark arm.
+	idempotency bool
 }
 
 type paymentsConfig struct {

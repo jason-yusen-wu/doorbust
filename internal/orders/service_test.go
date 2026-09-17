@@ -109,7 +109,7 @@ func TestCreateOrderNeverOversells(t *testing.T) {
 					// collide rather than arriving in a queue.
 					<-start
 
-					_, err := service.CreateOrder(context.Background(), productID, buyer(i))
+					_, err := service.CreateOrder(context.Background(), CreateOrderParams{ProductID: productID, Claims: buyer(i)})
 					switch {
 					case err == nil:
 						reserved.Add(1)
@@ -152,7 +152,7 @@ func TestConcurrentCancelReleasesOnce(t *testing.T) {
 			service, _ := newTestService(pool, 15*time.Minute, arm)
 
 			claims := buyer(0)
-			order, err := service.CreateOrder(context.Background(), productID, claims)
+			order, err := service.CreateOrder(context.Background(), CreateOrderParams{ProductID: productID, Claims: claims})
 			if err != nil {
 				t.Fatalf("reserve: %v", err)
 			}
@@ -200,7 +200,7 @@ func TestRedeliveredPaymentCommitsStockOnce(t *testing.T) {
 	claims := buyer(0)
 	ctx := context.Background()
 
-	order, err := service.CreateOrder(ctx, productID, claims)
+	order, err := service.CreateOrder(ctx, CreateOrderParams{ProductID: productID, Claims: claims})
 	if err != nil {
 		t.Fatalf("reserve: %v", err)
 	}
@@ -261,7 +261,7 @@ func TestFailPaymentReleasesStock(t *testing.T) {
 	claims := buyer(0)
 	ctx := context.Background()
 
-	order, err := service.CreateOrder(ctx, productID, claims)
+	order, err := service.CreateOrder(ctx, CreateOrderParams{ProductID: productID, Claims: claims})
 	if err != nil {
 		t.Fatalf("reserve: %v", err)
 	}
@@ -302,7 +302,7 @@ func TestSweeperReleasesExpiredReservation(t *testing.T) {
 	claims := buyer(0)
 	ctx := context.Background()
 
-	order, err := service.CreateOrder(ctx, productID, claims)
+	order, err := service.CreateOrder(ctx, CreateOrderParams{ProductID: productID, Claims: claims})
 	if err != nil {
 		t.Fatalf("reserve: %v", err)
 	}
@@ -356,7 +356,7 @@ func TestSweeperLeavesLiveReservationsAlone(t *testing.T) {
 	service, _ := newTestService(pool, time.Hour)
 
 	ctx := context.Background()
-	order, err := service.CreateOrder(ctx, productID, buyer(0))
+	order, err := service.CreateOrder(ctx, CreateOrderParams{ProductID: productID, Claims: buyer(0)})
 	if err != nil {
 		t.Fatalf("reserve: %v", err)
 	}
@@ -383,7 +383,7 @@ func TestCheckoutSurfacesGatewayFailure(t *testing.T) {
 	ctx := context.Background()
 	claims := buyer(0)
 
-	order, err := service.CreateOrder(ctx, productID, claims)
+	order, err := service.CreateOrder(ctx, CreateOrderParams{ProductID: productID, Claims: claims})
 	if err != nil {
 		t.Fatalf("reserve: %v", err)
 	}
@@ -415,11 +415,11 @@ func TestListOrders(t *testing.T) {
 	mine, theirs := buyer(1), buyer(2)
 
 	for range 3 {
-		if _, err := service.CreateOrder(ctx, productID, mine); err != nil {
+		if _, err := service.CreateOrder(ctx, CreateOrderParams{ProductID: productID, Claims: mine}); err != nil {
 			t.Fatalf("reserve: %v", err)
 		}
 	}
-	if _, err := service.CreateOrder(ctx, productID, theirs); err != nil {
+	if _, err := service.CreateOrder(ctx, CreateOrderParams{ProductID: productID, Claims: theirs}); err != nil {
 		t.Fatalf("reserve for other buyer: %v", err)
 	}
 
@@ -490,7 +490,7 @@ func TestOwnershipIsEnforced(t *testing.T) {
 	owner, stranger := buyer(1), buyer(2)
 	ctx := context.Background()
 
-	order, err := service.CreateOrder(ctx, productID, owner)
+	order, err := service.CreateOrder(ctx, CreateOrderParams{ProductID: productID, Claims: owner})
 	if err != nil {
 		t.Fatalf("reserve: %v", err)
 	}
@@ -528,7 +528,7 @@ func TestOwnershipFallsBackToEmailForLegacyRows(t *testing.T) {
 		t.Fatal("expected a customer with no cognito_sub")
 	}
 
-	order, err := service.CreateOrder(ctx, productID, auth.Claims{Email: "legacy@example.test"})
+	order, err := service.CreateOrder(ctx, CreateOrderParams{ProductID: productID, Claims: auth.Claims{Email: "legacy@example.test"}})
 	if err != nil {
 		t.Fatalf("reserve: %v", err)
 	}

@@ -53,6 +53,9 @@ func main() {
 			// project shipped with, so behaviour is unchanged unless asked.
 			reserveStrategy: env.GetString("RESERVE_STRATEGY", orders.StrategyBaseline),
 			customerCache:   env.GetBool("CUSTOMER_CACHE", false),
+			// On by default: a retried POST /orders reserving a second unit is
+			// a bug, and a client that sends no key is unaffected either way.
+			idempotency: env.GetBool("ORDER_IDEMPOTENCY", true),
 		},
 		payments: paymentsConfig{
 			pollInterval: env.GetDuration("STRIPE_POLL_INTERVAL", 5*time.Second),
@@ -66,6 +69,16 @@ func main() {
 			// that is too small is a permanently skipped event.
 			eventPollOverlap:     env.GetDuration("STRIPE_EVENT_POLL_OVERLAP", 2*time.Minute),
 			eventInitialLookback: env.GetDuration("STRIPE_EVENT_INITIAL_LOOKBACK", time.Hour),
+		},
+
+		// Off by default so no existing deployment silently starts rejecting
+		// traffic on upgrade, and so a benchmark measures the reserve path
+		// rather than the limiter. Set both to enable.
+		rateLimit: rateLimitConfig{
+			perIP:      float64(env.GetInt("RATE_LIMIT_PER_IP_RPS", 0)),
+			perSubject: float64(env.GetInt("RATE_LIMIT_PER_SUBJECT_RPS", 0)),
+			burst:      env.GetInt("RATE_LIMIT_BURST", 20),
+			idle:       env.GetDuration("RATE_LIMIT_IDLE", 10*time.Minute),
 		},
 
 		// Unset in production: the frontend is served by this process, so
