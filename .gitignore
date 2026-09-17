@@ -10,3 +10,7 @@ CONTEXT.md
 *.tfvars
 infra/deploy_key
 infra/deploy_key.pub
+
+# Benchmark binaries. Results under bench/results/ ARE committed — the README
+# quotes them, so they have to be auditable.
+bin/

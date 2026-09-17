@@ -16,7 +16,10 @@ func main() {
 	// create Top-level Context
 	ctx := context.Background()
 	cfg := config{
-		addr:            ":8080",
+		// Configurable so a second instance can run alongside the deployed
+		// one — the benchmark's honesty run starts the app on another port
+		// rather than disturbing the live service.
+		addr:            env.GetString("ADDR", ":8080"),
 		shutdownTimeout: env.GetDuration("SHUTDOWN_TIMEOUT", 15*time.Second),
 		db: postgresql.Config{
 			DSN:             env.MustGetString("GOOSE_DBSTRING"),
