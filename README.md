@@ -11,7 +11,7 @@ succeed, and you find out when a customer emails about an order you can't ship.
 Doorbust solves that with one small idea, applied consistently, and then
 measures the result instead of asserting it.
 
-https://github.com/user-attachments/assets/95b81884-d77a-4e98-9e52-40f7f5c0840e
+![Doorbust Demo Video](https://github.com/user-attachments/assets/95b81884-d77a-4e98-9e52-40f7f5c0840e)
 
 
 ---
