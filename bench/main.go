@@ -73,6 +73,8 @@ func bind(fs *flag.FlagSet) *flags {
 	fs.StringVar(&o.DSN, "dsn", envOr("BENCH_DATABASE_URL",
 		"postgres://postgres:postgres@localhost:55433/doorbust_bench?sslmode=disable"),
 		"benchmark database DSN (NOT the test database, and never production)")
+	fs.BoolVar(&o.AllowUnsafeTarget, "i-know-this-truncates", false,
+		"run even though the DSN does not name a throwaway benchmark database")
 	fs.StringVar(&o.MigrationsDir, "migrations", "./internal/adapters/postgresql/migrations", "goose migrations directory")
 	fs.StringVar(&o.AppBinary, "app", "./bin/doorbust", "app binary to start and measure")
 	fs.StringVar(&o.Addr, "addr", ":8099", "address the app under test should listen on")

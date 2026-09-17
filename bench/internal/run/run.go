@@ -35,10 +35,13 @@ import (
 )
 
 type Options struct {
-	DSN           string
-	MigrationsDir string
-	AppBinary     string
-	Addr          string
+	DSN string
+	// AllowUnsafeTarget skips the check that the DSN names a throwaway
+	// benchmark database. bench TRUNCATEs every table it is pointed at.
+	AllowUnsafeTarget bool
+	MigrationsDir     string
+	AppBinary         string
+	Addr              string
 
 	Arm           string
 	CustomerCache bool
@@ -93,6 +96,12 @@ func Execute(ctx context.Context, opts Options) (*report.Result, error) {
 				"file descriptor hard limit is %d but this run needs about %d; lower -max-inflight or raise the limit",
 				hard, need)
 		}
+	}
+
+	// Before anything else, and before opening a connection: bench destroys the
+	// contents of whatever it is pointed at.
+	if err := workload.CheckTarget(opts.DSN, opts.AllowUnsafeTarget); err != nil {
+		return nil, err
 	}
 
 	pool, err := pgxpool.New(ctx, opts.DSN)
