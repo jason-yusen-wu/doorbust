@@ -57,6 +57,8 @@ type Options struct {
 
 	MaxInFlight int
 	Timeout     time.Duration
+	// SpinSlack tunes the dispatcher's busy-wait. Zero on a CPU-starved box.
+	SpinSlack time.Duration
 
 	// GitSHA identifies the commit this binary was built from, for runs that
 	// happen away from a checkout. Empty means "read it from the working tree".
@@ -208,6 +210,7 @@ func Execute(ctx context.Context, opts Options) (*report.Result, error) {
 		MaxInFlight: opts.MaxInFlight,
 		Timeout:     opts.Timeout,
 		Client:      loadgen.NewClient(opts.MaxInFlight, opts.Timeout),
+		SpinSlack:   opts.SpinSlack,
 		Rand:        rand.New(rand.NewPCG(opts.Seed, 1)),
 	})
 	if err != nil {

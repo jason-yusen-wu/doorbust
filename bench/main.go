@@ -26,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jason-yusen-wu/doorbust/bench/internal/loadgen"
 	"github.com/jason-yusen-wu/doorbust/bench/internal/report"
 	"github.com/jason-yusen-wu/doorbust/bench/internal/run"
 	"github.com/jason-yusen-wu/doorbust/bench/internal/workload"
@@ -95,6 +96,8 @@ func bind(fs *flag.FlagSet) *flags {
 
 	fs.IntVar(&o.MaxInFlight, "max-inflight", 0, "concurrent request ceiling (default: one second of arrivals)")
 	fs.DurationVar(&o.Timeout, "timeout", 10*time.Second, "per-request timeout")
+	fs.DurationVar(&o.SpinSlack, "spin-slack", loadgen.DefaultSpinSlack,
+		"busy-wait this long before each deadline; set 0 when cores are scarce")
 
 	tier := fs.Int("tier", 1, "1 = loopback (relative only), 2 = on the deployed box (absolute)")
 	fs.StringVar(&o.GitSHA, "git-sha", "",

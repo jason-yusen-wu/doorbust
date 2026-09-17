@@ -33,6 +33,10 @@ type Config struct {
 	Timeout     time.Duration
 	Client      *http.Client
 	Rand        *rand.Rand
+
+	// SpinSlack is how long before a deadline the dispatcher stops sleeping and
+	// busy-waits. Zero means pure sleeping. See waitUntil.
+	SpinSlack time.Duration
 }
 
 // Results is what one measured phase produced.
@@ -72,7 +76,7 @@ func Run(ctx context.Context, cfg Config) (Results, error) {
 		// per request would make timer error, not the schedule, decide when
 		// requests go out — and the generator would fall progressively behind,
 		// which is coordinated omission arriving through the back door.
-		waitUntil(start.Add(due))
+		waitUntil(start.Add(due), cfg.SpinSlack)
 
 		sentAt := time.Now()
 		rec.lag[i] = sentAt.Sub(start.Add(due)).Nanoseconds()
@@ -136,26 +140,31 @@ func Run(ctx context.Context, cfg Config) (Results, error) {
 	}, nil
 }
 
-// spinSlack is how long before a deadline the dispatcher stops sleeping and
-// starts spinning.
+// DefaultSpinSlack suits a machine with cores to spare.
 //
 // time.Sleep on macOS routinely overshoots by 1-2ms, and that overshoot showed
 // up directly as p99 schedule lag above the validity threshold even at trivial
 // rates. The overshoot is not cumulative — the schedule is absolute, so each
 // request is late independently — but it is still a millisecond or two added to
 // every measured latency, which at loopback timings is larger than the thing
-// being measured.
-//
-// So: sleep to within spinSlack of the deadline, then busy-wait the remainder.
-// That burns at most one core for a few milliseconds per wait, which is a real
-// cost on a Tier-1 box where the generator shares CPU with the app — and is why
-// it is bounded to a few milliseconds rather than spinning the whole gap. At
-// high rates the coalescing loop means it rarely waits at all.
-const spinSlack = 3 * time.Millisecond
+// being measured. Sleeping to within a few milliseconds of the deadline and
+// busy-waiting the remainder removes it.
+const DefaultSpinSlack = 3 * time.Millisecond
 
-func waitUntil(deadline time.Time) {
-	if d := time.Until(deadline) - spinSlack; d > 0 {
+// waitUntil blocks until the deadline.
+//
+// **Spinning is not free, and on a small box it is actively harmful.** It burns
+// a core, and where the generator shares only two vCPUs with the app under
+// test, that is a core the app needed — the generator then starves the very
+// thing it is measuring and reports schedule lag caused by its own busy-wait.
+// Pass slack = 0 there: Linux timers are accurate enough that pure sleeping
+// keeps to the schedule, which is exactly the case macOS is not.
+func waitUntil(deadline time.Time, slack time.Duration) {
+	if d := time.Until(deadline) - slack; d > 0 {
 		time.Sleep(d)
+	}
+	if slack <= 0 {
+		return
 	}
 	for time.Now().Before(deadline) {
 		runtime.Gosched()
