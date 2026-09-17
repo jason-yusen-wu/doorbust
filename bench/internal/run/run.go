@@ -119,6 +119,13 @@ func Execute(ctx context.Context, opts Options) (*report.Result, error) {
 		return nil, err
 	}
 
+	// The generator must not take down the machine it is measuring on. This
+	// check is the memory counterpart of the descriptor check above, and it
+	// exists because its absence wedged the deployed box.
+	if err := loadgen.CheckMemoryBudget(opts.MaxInFlight); err != nil {
+		return nil, err
+	}
+
 	pool, err := pgxpool.New(ctx, opts.DSN)
 	if err != nil {
 		return nil, fmt.Errorf("connect to bench database: %w", err)
