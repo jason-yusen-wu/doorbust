@@ -94,7 +94,13 @@ func gitState() (sha string, dirty bool) {
 	}
 	sha = strings.TrimSpace(string(out))
 
-	status, err := exec.Command("git", "status", "--porcelain").Output()
+	// Results are excluded from the dirtiness check. The check exists to
+	// guarantee the recorded SHA describes the code that produced the numbers,
+	// and a result file is an output of that code, not an input to it — a run
+	// cannot invalidate itself by writing down what it found. Without this the
+	// first recorded run of a session makes the tree dirty and every run after
+	// it refuses to start.
+	status, err := exec.Command("git", "status", "--porcelain", "--", ".", ":(exclude)bench/results").Output()
 	if err != nil {
 		return sha, true
 	}
