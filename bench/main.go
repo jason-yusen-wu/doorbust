@@ -282,8 +282,14 @@ func summarize(w io.Writer, r *report.Result) {
 		r.Model.PredictedCeiling, r.Model.ClientRTTsInLock, r.Model.RTTMicros, r.Model.CommitCostMicros)
 
 	l := r.Latency.Overall
-	fmt.Fprintf(w, "  latency   p50 %.0fus  p95 %.0fus  p99 %.0fus  p99.9 %.0fus  max %.0fus\n",
-		l.P50, l.P95, l.P99, l.P999, l.Max)
+	fmt.Fprintf(w, "  latency   p50 %.0fus  p95 %.0fus  p99 %.0fus", l.P50, l.P95, l.P99)
+	if r.Schedule.TrustedPercentile == report.TrustP999 {
+		fmt.Fprintf(w, "  p99.9 %.0fus  max %.0fus", l.P999, l.Max)
+	} else {
+		// Printing a number this run cannot support is how a caveat gets lost.
+		fmt.Fprintf(w, "  p99.9 (untrusted: %.2f%% late sends)", r.Schedule.LateFraction*100)
+	}
+	fmt.Fprintln(w)
 	fmt.Fprintf(w, "  lag       p50 %.0fus  p99 %.0fus  max %.0fus  late %d (%.3f%%)  saturated %d\n",
 		r.Schedule.LagP50Micros, r.Schedule.LagP99Micros, r.Schedule.LagMaxMicros,
 		r.Schedule.LateRequests, r.Schedule.LateFraction*100, r.Schedule.GeneratorSaturated)

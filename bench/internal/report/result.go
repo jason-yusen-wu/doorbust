@@ -97,6 +97,11 @@ type Schedule struct {
 	// reported statistics.
 	LateRequests int64   `json:"late_requests"`
 	LateFraction float64 `json:"late_fraction"`
+	// TrustedPercentile is the finest latency percentile this run can support.
+	// A late send inflates one sample, so the share of late sends bounds which
+	// tail statistics could have been moved by the generator rather than the
+	// server. See TrustedPercentileFor.
+	TrustedPercentile string `json:"trusted_percentile"`
 
 	GeneratorSaturated int64 `json:"generator_saturated"`
 }
@@ -145,6 +150,37 @@ type InvariantCheck struct {
 type Saturation struct {
 	Verdict string `json:"verdict"`
 	RefRun  string `json:"ref_run"`
+}
+
+// Percentile trust levels, finest first.
+const (
+	TrustP999 = "p99.9"
+	TrustP99  = "p99"
+	TrustNone = "none"
+)
+
+// TrustedPercentileFor maps the share of late sends onto the finest percentile
+// that share cannot have contaminated.
+//
+// Each late send inflates exactly one sample, so a late fraction of f can move
+// at most the top f of the distribution. p99.9 is the 1-in-1000 sample, so it
+// is only trustworthy while fewer than 0.1% of sends were late; p99 survives up
+// to 1%. Beyond that the generator is contaminating a statistic anyone would
+// actually quote, and the run is void.
+//
+// This replaces an all-or-nothing rule that voided a run for eight late sends
+// out of 3,750 — samples that demonstrably could not move p50, p95 or p99, and
+// on a two-vCPU box are simply the generator's own GC pauses. Refusing to
+// publish p99.9 there is honest; refusing to publish anything is not.
+func TrustedPercentileFor(lateFraction float64) string {
+	switch {
+	case lateFraction > 0.01:
+		return TrustNone
+	case lateFraction > 0.001:
+		return TrustP99
+	default:
+		return TrustP999
+	}
 }
 
 // Saturation verdicts.

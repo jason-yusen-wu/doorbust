@@ -158,6 +158,7 @@ func (r *recorder) scheduleStats(from int) report.Schedule {
 	}
 
 	return report.Schedule{
+		TrustedPercentile:  report.TrustedPercentileFor(fraction),
 		Requests:           total,
 		LagP50Micros:       p.P50,
 		LagP99Micros:       p.P99,

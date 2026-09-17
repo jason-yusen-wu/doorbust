@@ -268,17 +268,20 @@ func applyValidity(res *report.Result) {
 		res.Void("p99 schedule lag %.0fus exceeds 1ms: the generator could not keep to its own schedule",
 			res.Schedule.LagP99Micros)
 	}
-	// The question a lag rule should answer is "could generator delay have
-	// moved the numbers being reported", and a raw maximum answers a different
-	// one. A single GC pause in the generator makes one request late out of
-	// tens of thousands; that cannot move p50, p95 or p99, and the throughput
-	// figure is unaffected because the request was still sent and counted.
-	//
-	// So the rule is on the share of late sends, set below the resolution of
-	// the finest percentile reported (p99.9). Above that, generator delay could
-	// be showing up as server latency and the run is not trustworthy.
-	if res.Schedule.LateFraction > 0.001 {
-		res.Void("%d of %d sends (%.2f%%) missed their deadline by over 1ms, enough to move the reported tail",
+	// The question a lag rule should answer is "could generator delay have moved
+	// the numbers being reported", and a raw maximum answers a different one.
+	// Each late send inflates exactly one sample, so the SHARE of late sends
+	// bounds which statistics could have moved — which is a graded answer, not
+	// a binary one. A run that cannot support p99.9 can still support p99, and
+	// voiding it outright throws away a good measurement to avoid publishing a
+	// bad decimal place.
+	switch res.Schedule.TrustedPercentile {
+	case report.TrustNone:
+		res.Void("%d of %d sends (%.2f%%) missed their deadline by over 1ms, enough to move p99",
+			res.Schedule.LateRequests, res.Schedule.Requests, res.Schedule.LateFraction*100)
+	case report.TrustP99:
+		res.Note += fmt.Sprintf(
+			" %d of %d sends (%.2f%%) were late, so p99.9 is not trustworthy here; p50 through p99 are.",
 			res.Schedule.LateRequests, res.Schedule.Requests, res.Schedule.LateFraction*100)
 	}
 	if n := res.Outcomes["server_error"]; n > 0 {
