@@ -162,7 +162,19 @@ func Execute(ctx context.Context, opts Options) (*report.Result, error) {
 		return nil, err
 	}
 
-	res.Model = ProbeModel(ctx, pool, opts.Arm, 0)
+	// Exec time needs a real product and customer to aim at, and the probe
+	// rolls back so it consumes neither.
+	var probeCustomer int64
+	if err := pool.QueryRow(ctx,
+		`SELECT id FROM customers ORDER BY id LIMIT 1`).Scan(&probeCustomer); err != nil {
+		return nil, fmt.Errorf("find a seeded customer for the exec probe: %w", err)
+	}
+	execMicros, err := ProbeExec(ctx, pool, opts.Arm, productIDs[0], probeCustomer)
+	if err != nil {
+		return nil, fmt.Errorf("probe exec time: %w", err)
+	}
+
+	res.Model = ProbeModel(ctx, pool, opts.Arm, execMicros)
 
 	out, err := loadgen.Run(ctx, loadgen.Config{
 		BaseURL:     baseURL,
