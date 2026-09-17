@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
-import { ApiError, createOrder, getProduct } from '../lib/api'
+import { ApiError, createOrder, getProduct, newIdempotencyKey } from '../lib/api'
 import type { Product } from '../lib/types'
 import { errorCopy } from '../lib/errors'
 import { useAuth, useUnauthorizedHandler } from '../auth/AuthContext'
@@ -19,10 +19,19 @@ export function SaleDetail() {
   const [reserveError, setReserveError] = useState<ApiError | null>(null)
   const [reserving, setReserving] = useState(false)
 
-  // Rule 1: POST /orders is NOT idempotent — a second call reserves a second
-  // unit. A ref, not state: state updates are async and two fast clicks can
-  // both observe `reserving === false` before either re-render lands.
+  // Rule 1, amended: POST /orders is now idempotent *per key*, so a duplicate
+  // submit can no longer reserve a second unit. This ref is therefore no longer
+  // the thing standing between a double-click and a double charge — it just
+  // saves a pointless round trip. Still a ref, not state: state updates are
+  // async and two fast clicks can both observe `reserving === false` before
+  // either re-render lands.
   const inFlight = useRef(false)
+
+  // The key identifying one reserve attempt, held across retries of that same
+  // attempt so retrying is safe. Generating a fresh key per click would defeat
+  // the mechanism entirely, so it is cleared only when the attempt is genuinely
+  // over — see the catch below.
+  const idempotencyKey = useRef<string | null>(null)
 
   const load = useCallback(
     (signal?: AbortSignal) =>
@@ -67,14 +76,30 @@ export function SaleDetail() {
     setReserving(true)
     setReserveError(null)
 
+    idempotencyKey.current ??= newIdempotencyKey()
+
     try {
-      const order = await createOrder(productId, token)
+      const order = await createOrder(productId, token, idempotencyKey.current)
       // Carry the name forward: GET /orders/{id} does not return product_name.
       navigate(`/checkout/${order.id}`, { state: { productName: product?.name } })
     } catch (err) {
       if (handleUnauthorized(err)) return
       if (err instanceof ApiError) {
         setReserveError(err)
+
+        // Whether to keep the key is the whole design.
+        //
+        // A definitive answer — sold out, not found — ends this attempt, so the
+        // next click is a NEW intent and must carry a new key; reusing it would
+        // replay a decision the user has already seen. A transient failure
+        // (5xx, rate limited, or the first attempt still running) says nothing
+        // about whether the reserve happened, and that is exactly the case the
+        // key exists for: retrying with it is safe, retrying without it is how
+        // a second unit gets taken.
+        const attemptIsOver =
+          err.code === 'out_of_stock' || err.code === 'not_found' || err.code === 'forbidden'
+        if (attemptIsOver) idempotencyKey.current = null
+
         // 409 out_of_stock means someone else won the row. Re-read so the
         // count on screen matches what the server just told us.
         if (err.code === 'out_of_stock') void load()

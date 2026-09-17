@@ -16,6 +16,9 @@ export const ERROR_CODES = [
   'conflict',
   'out_of_stock',
   'order_not_pending',
+  'idempotency_key_reused',
+  'reserve_in_progress',
+  'rate_limited',
   'internal_error',
 ] as const
 
@@ -49,6 +52,22 @@ const COPY: Record<ErrorCode, ErrorCopy> = {
   order_not_pending: {
     headline: 'This order has already moved on.',
     body: 'Its hold was resolved — check the order for where it stands.',
+  },
+  // A key replayed with a different body. A client bug rather than anything
+  // the user did, so the copy does not ask them to change their behaviour.
+  idempotency_key_reused: {
+    headline: "That didn't go through.",
+    body: 'Something went wrong on our side. Reload the page and try again.',
+  },
+  // The first attempt is still running. Genuinely transient, and the right
+  // advice is simply to wait a beat — retrying with the same key is safe.
+  reserve_in_progress: {
+    headline: 'Still working on your last try.',
+    body: 'Give it a second, then try again. You will not be charged twice.',
+  },
+  rate_limited: {
+    headline: 'Too many tries, too fast.',
+    body: 'Wait a moment before trying again.',
   },
   conflict: {
     headline: "That didn't go through.",
