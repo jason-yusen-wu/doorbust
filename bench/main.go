@@ -277,8 +277,9 @@ func summarize(w io.Writer, r *report.Result) {
 	l := r.Latency.Overall
 	fmt.Fprintf(w, "  latency   p50 %.0fus  p95 %.0fus  p99 %.0fus  p99.9 %.0fus  max %.0fus\n",
 		l.P50, l.P95, l.P99, l.P999, l.Max)
-	fmt.Fprintf(w, "  lag       p50 %.0fus  p99 %.0fus  max %.0fus  saturated %d\n",
-		r.Schedule.LagP50Micros, r.Schedule.LagP99Micros, r.Schedule.LagMaxMicros, r.Schedule.GeneratorSaturated)
+	fmt.Fprintf(w, "  lag       p50 %.0fus  p99 %.0fus  max %.0fus  late %d (%.3f%%)  saturated %d\n",
+		r.Schedule.LagP50Micros, r.Schedule.LagP99Micros, r.Schedule.LagMaxMicros,
+		r.Schedule.LateRequests, r.Schedule.LateFraction*100, r.Schedule.GeneratorSaturated)
 
 	fmt.Fprintf(w, "  outcomes  ")
 	for _, name := range []string{"reserved", "out_of_stock", "server_error", "timeout", "connect_error", "generator_saturated"} {

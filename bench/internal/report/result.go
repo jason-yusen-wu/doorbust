@@ -87,11 +87,18 @@ type Workload struct {
 // request was due to be sent and when it actually was; if that grows, the
 // generator is the bottleneck and the run says nothing about the server.
 type Schedule struct {
-	Requests           int     `json:"requests"`
-	LagP50Micros       float64 `json:"lag_p50_us"`
-	LagP99Micros       float64 `json:"lag_p99_us"`
-	LagMaxMicros       float64 `json:"lag_max_us"`
-	GeneratorSaturated int64   `json:"generator_saturated"`
+	Requests     int     `json:"requests"`
+	LagP50Micros float64 `json:"lag_p50_us"`
+	LagP99Micros float64 `json:"lag_p99_us"`
+	LagMaxMicros float64 `json:"lag_max_us"`
+	// LateRequests is how many sends missed their deadline by more than a
+	// millisecond, and LateFraction that as a share of the run. This, not the
+	// raw maximum, is what decides whether generator delay could have moved the
+	// reported statistics.
+	LateRequests int64   `json:"late_requests"`
+	LateFraction float64 `json:"late_fraction"`
+
+	GeneratorSaturated int64 `json:"generator_saturated"`
 }
 
 // Throughput is deliberately three numbers. Goodput is the per-SKU ceiling the

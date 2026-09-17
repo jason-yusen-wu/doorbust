@@ -135,7 +135,7 @@ func (r *recorder) collect(from int) (report.Latencies, map[string]int64) {
 // the run's self-check: if lag grew, the numbers describe the generator.
 func (r *recorder) scheduleStats(from int) report.Schedule {
 	var lags []int64
-	var saturated int64
+	var saturated, late int64
 
 	for i := from; i < len(r.outcome); i++ {
 		if r.outcome[i] == OutcomeGeneratorSaturated {
@@ -143,15 +143,27 @@ func (r *recorder) scheduleStats(from int) report.Schedule {
 		}
 		if r.sent[i] {
 			lags = append(lags, r.lag[i])
+			if r.lag[i] > int64(time.Millisecond) {
+				late++
+			}
 		}
 	}
 
 	p := percentilesOf(lags)
+	total := len(r.outcome) - from
+
+	var fraction float64
+	if total > 0 {
+		fraction = float64(late) / float64(total)
+	}
+
 	return report.Schedule{
-		Requests:           len(r.outcome) - from,
+		Requests:           total,
 		LagP50Micros:       p.P50,
 		LagP99Micros:       p.P99,
 		LagMaxMicros:       p.Max,
+		LateRequests:       late,
+		LateFraction:       fraction,
 		GeneratorSaturated: saturated,
 	}
 }
